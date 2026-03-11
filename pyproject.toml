@@ -1,0 +1,30 @@
+[project]
+name = "loki-triage"
+version = "0.1.0"
+description = "CLI-first Loki scan ingestion, triage, enrichment, and reporting pipeline"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "jinja2>=3.1.6",
+  "pyyaml>=6.0.3",
+  "typer>=0.17.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.5",
+]
+
+[project.scripts]
+loki-triage = "loki_triage.cli:app"
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/loki_triage"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
