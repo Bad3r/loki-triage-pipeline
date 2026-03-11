@@ -1,0 +1,4 @@
+20260103T00:00:00Z,BETA,NOTICE,Init,Starting Loki Scan VERSION: 0.51.0 SYSTEM: BETA TIME: 20260103T00:00:00Z
+20260103T00:00:01Z,BETA,ERROR,Init,Error while initializing Yara rule 'C:\signatures\bad_rule.yar' ERROR: embedded null character
+20260103T00:00:02Z,BETA,ALERT,FileScan,FILE: C:\Temp\odd.dll SCORE: 90 TYPE: DLL SIZE: 20 FIRST_BYTES: 4d5a MD5: 33333333333333333333333333333333 SHA1: 4444444444444444444444444444444444444444 SHA256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc CREATED: Fri Jan  3 00:00:00 2026 MODIFIED: Fri Jan  3 00:00:00 2026 ACCESSED: Fri Jan  3 00:00:00 2026 REASON_1:
+20260103T00:00:03Z,BETA,NOTICE,Results,Results: 1 alerts, 0 warnings, 0 notices
