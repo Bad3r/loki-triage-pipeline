@@ -1,0 +1,59 @@
+# Python/runtime artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.uv/
+.mypy_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage
+
+# Environment and local secrets
+.env
+.env.*
+*.pem
+*.key
+*.secret
+*.secrets
+*_token*
+*_apikey*
+
+# Sensitive scan inputs / evidence
+LokiScanResults/
+**/LokiScanResults/
+**/Loki-Rescan/
+LokiScanResults/**/*.log
+**/Loki-Rescan/**/*.log
+runs/**/*.log
+
+# Derived triage data and reporting outputs
+runs/
+reports/
+state/
+
+# DB and other persistent evidence stores
+*.db
+*.db-*
+*.sqlite
+*.sqlite*
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+
+# Run/workflow artifacts (precautionary for future)
+**/manifest.json
+**/manifest.json.tmp
+**/*.manifest.json
+**/normalized_events.jsonl
+**/findings.jsonl
+**/triage_queue.jsonl
+**/manifest.*
+**/report/*.jsonl
+**/report/*.csv
+**/report/*.html
+**/report/*.pdf
+**/exports/*.jsonl
+**/exports/*.csv
+*.tmp
