@@ -1,0 +1,22 @@
+profile: public_safe
+profiles:
+  public_safe:
+    batch_size: 4
+    sleep_seconds: 18
+    include_fields:
+      - type_description
+      - meaningful_name
+      - names
+      - reputation
+      - size
+      - last_analysis_stats
+      - popular_threat_classification
+      - times_submitted
+      - first_submission_date
+      - last_submission_date
+      - last_analysis_date
+  private_fast:
+    batch_size: 20
+    sleep_seconds: 2
+    include_fields:
+      - "**"

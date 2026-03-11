@@ -1,0 +1,20 @@
+default_queue:
+  ALERT: true
+  WARNING: true
+  ERROR: true
+  NOTICE: true
+  RESULT: false
+  INFO: false
+priorities:
+  ALERT: critical
+  WARNING: high
+  ERROR: medium
+  NOTICE: low
+  RESULT: info
+  INFO: info
+process_event_overrides:
+  listening_process: low
+  patched_process: high
+  replaced_process: critical
+  priority_anomaly: medium
+  generic_process_alert: medium
