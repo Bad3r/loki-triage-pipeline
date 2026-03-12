@@ -347,7 +347,7 @@
           </tr>
         </thead>
         <tbody>
-          {% set important = dataset.findings[:15] %}
+          {% set important = dataset.findings[:dataset.report_limits.get('top_findings_limit', 20)] %}
           {% if important %}
             {% for row in important %}
             <tr>
@@ -412,6 +412,11 @@
         <h2 class="section-title">Technical Appendix</h2>
         <div class="section-subtitle">Grouped by host for analyst follow-up</div>
       </div>
+      <div class="note">
+        PDF appendix scope is capped to the top {{ dataset.report_limits.get('appendix_host_limit', 25) }} hosts
+        and the top {{ dataset.report_limits.get('appendix_findings_per_host', 10) }} summarized findings per host.
+        Full detail remains in the machine-readable report export.
+      </div>
       {% if dataset.appendix %}
         {% for host, items in dataset.appendix.items() %}
         <div class="appendix-host">
@@ -425,7 +430,10 @@
                 <span class="pill priority-{{ row.priority }}">{{ row.priority }}</span>
                 <span class="pill disposition-{{ row.current_disposition }}">{{ row.current_disposition }}</span>
               </div>
-              <div class="meta-row">Seen: {{ row.occurrence_ts }} | State: {{ row.state_for_host_run or '-' }}</div>
+              <div class="meta-row">
+                First seen: {{ row.first_occurrence_ts }} | Last seen: {{ row.last_occurrence_ts }}
+              </div>
+              <div class="meta-row">Occurrences: {{ row.occurrence_count }} | State: {{ row.state_for_host_run or '-' }}</div>
               <div class="meta-row">Rule: <span class="mono">{{ row.rule_key }}</span></div>
               {% if row.artifact_path %}
               <div class="meta-row">Artifact: {{ row.artifact_path }}</div>

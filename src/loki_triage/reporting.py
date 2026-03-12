@@ -14,6 +14,30 @@ from .utils import compact_utc_now, utc_now, write_csv
 
 
 BROWSER_CANDIDATES = ["chromium", "chromium-browser", "google-chrome", "chrome"]
+TOP_HOSTS_LIMIT = 15
+DEFAULT_TOP_FINDINGS_LIMIT = 20
+DEFAULT_APPENDIX_HOST_LIMIT = 25
+DEFAULT_APPENDIX_FINDINGS_PER_HOST = 10
+PDF_RENDER_TIMEOUT_SECONDS = 900
+PRIORITY_ORDER_SQL = """
+CASE f.priority
+    WHEN 'critical' THEN 5
+    WHEN 'high' THEN 4
+    WHEN 'medium' THEN 3
+    WHEN 'low' THEN 2
+    ELSE 1
+END
+"""
+SEVERITY_ORDER_SQL = """
+CASE f.severity
+    WHEN 'ALERT' THEN 5
+    WHEN 'WARNING' THEN 4
+    WHEN 'ERROR' THEN 3
+    WHEN 'NOTICE' THEN 2
+    WHEN 'RESULT' THEN 1
+    ELSE 0
+END
+"""
 
 
 
@@ -26,7 +50,12 @@ def _scope_run_ids(conn, period: str, run_id: str | None) -> list[str]:
 
 
 
-def _query_report_dataset(conn, run_ids: list[str], lookup_profile: str) -> dict[str, Any]:
+def _query_report_dataset(
+    conn,
+    run_ids: list[str],
+    lookup_profile: str,
+    report_config: dict[str, Any],
+) -> dict[str, Any]:
     if not run_ids:
         return {
             "kpis": {},
@@ -44,7 +73,6 @@ def _query_report_dataset(conn, run_ids: list[str], lookup_profile: str) -> dict
         {scope_clause}
         GROUP BY fo.host
         ORDER BY occurrence_count DESC, fo.host ASC
-        LIMIT 15
         """,
         run_ids,
     ).fetchall()
@@ -74,7 +102,40 @@ def _query_report_dataset(conn, run_ids: list[str], lookup_profile: str) -> dict
         JOIN findings f ON f.id = fo.finding_id
         LEFT JOIN vt_lookups vt ON vt.sha256 = fo.sha256 AND vt.lookup_profile = ?
         {scope_clause}
-        ORDER BY fo.host ASC, fo.occurrence_ts DESC, f.priority DESC
+        ORDER BY {PRIORITY_ORDER_SQL} DESC, {SEVERITY_ORDER_SQL} DESC, fo.occurrence_ts DESC, fo.host ASC
+        """,
+        [lookup_profile, *run_ids],
+    ).fetchall()
+    appendix_rows = conn.execute(
+        f"""
+        SELECT
+            f.id AS finding_id,
+            f.title,
+            f.current_disposition,
+            f.priority,
+            f.severity,
+            f.current_reason,
+            fo.host,
+            MIN(fo.occurrence_ts) AS first_occurrence_ts,
+            MAX(fo.occurrence_ts) AS last_occurrence_ts,
+            MAX(fo.state_for_host_run) AS state_for_host_run,
+            MAX(fo.event_type) AS event_type,
+            MAX(fo.event_kind) AS event_kind,
+            MAX(fo.artifact_path) AS artifact_path,
+            MAX(fo.sha256) AS sha256,
+            fo.rule_key,
+            MAX(fo.score) AS score,
+            MIN(fo.source_path) AS source_path,
+            MIN(fo.source_line_start) AS source_line_start,
+            MIN(fo.source_line_end) AS source_line_end,
+            COUNT(*) AS occurrence_count,
+            vt.summary_json AS vt_summary_json
+        FROM finding_occurrences fo
+        JOIN findings f ON f.id = fo.finding_id
+        LEFT JOIN vt_lookups vt ON vt.sha256 = fo.sha256 AND vt.lookup_profile = ?
+        {scope_clause}
+        GROUP BY fo.host, f.id, fo.rule_key, vt.summary_json
+        ORDER BY fo.host ASC, {PRIORITY_ORDER_SQL} DESC, {SEVERITY_ORDER_SQL} DESC, last_occurrence_ts DESC
         """,
         [lookup_profile, *run_ids],
     ).fetchall()
@@ -108,6 +169,14 @@ def _query_report_dataset(conn, run_ids: list[str], lookup_profile: str) -> dict
         """,
         run_ids,
     ).fetchall()
+    top_findings_limit = int(report_config.get("top_findings_limit", DEFAULT_TOP_FINDINGS_LIMIT))
+    appendix_host_limit = int(report_config.get("appendix_host_limit", DEFAULT_APPENDIX_HOST_LIMIT))
+    appendix_findings_per_host = int(
+        report_config.get("appendix_findings_per_host", DEFAULT_APPENDIX_FINDINGS_PER_HOST)
+    )
+    appendix_allowed_hosts = [
+        str(row["host"]) for row in host_rows[:appendix_host_limit] if row["host"] is not None
+    ]
     appendix: dict[str, list[dict[str, Any]]] = defaultdict(list)
     rendered_findings: list[dict[str, Any]] = []
     for row in finding_rows:
@@ -119,14 +188,35 @@ def _query_report_dataset(conn, run_ids: list[str], lookup_profile: str) -> dict
         else:
             item["vt_summary"] = None
         item.pop("vt_summary_json", None)
-        appendix[item.get("host") or "unknown-host"].append(item)
         rendered_findings.append(item)
+    for row in appendix_rows:
+        item = dict(row)
+        host = item.get("host") or "unknown-host"
+        if appendix_allowed_hosts and host not in appendix_allowed_hosts:
+            continue
+        if len(appendix[host]) >= appendix_findings_per_host:
+            continue
+        if item.get("vt_summary_json"):
+            import json
+
+            item["vt_summary"] = json.loads(item["vt_summary_json"])
+        else:
+            item["vt_summary"] = None
+        item.pop("vt_summary_json", None)
+        appendix[host].append(item)
     return {
         "kpis": dict(kpis) if kpis else {},
-        "top_hosts": [dict(row) for row in host_rows],
+        "top_hosts": [dict(row) for row in host_rows[:TOP_HOSTS_LIMIT]],
         "findings": rendered_findings,
         "appendix": dict(appendix),
         "recurrent_false_positives": [dict(row) for row in recurrent_false_positive_rows],
+        "report_limits": {
+            "top_findings_limit": top_findings_limit,
+            "appendix_host_limit": appendix_host_limit,
+            "appendix_findings_per_host": appendix_findings_per_host,
+            "appendix_host_count_rendered": len(appendix),
+            "appendix_host_count_total": len(host_rows),
+        },
     }
 
 
@@ -154,7 +244,18 @@ def _render_pdf(html_path: Path, pdf_path: Path) -> None:
         "--allow-file-access-from-files",
         html_path.resolve().as_uri(),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=PDF_RENDER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Chromium PDF rendering timed out after {PDF_RENDER_TIMEOUT_SECONDS} seconds"
+        ) from exc
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Chromium PDF rendering failed")
 
@@ -170,7 +271,7 @@ def build_report(period: str, run_id: str | None = None, project_root: Path | No
         if not run_ids:
             raise KeyError(f"No scan runs found for period {period!r}{f' and run {run_id!r}' if run_id else ''}")
         lookup_profile = str(runtime_config.vt_config.get("profile", "public_safe"))
-        dataset = _query_report_dataset(conn, run_ids, lookup_profile)
+        dataset = _query_report_dataset(conn, run_ids, lookup_profile, runtime_config.report_config)
         report_id = f"report-{period}-{compact_utc_now()}"
         report_dir = paths.runs_dir / period / (run_id or "period-summary") / "report"
         report_dir.mkdir(parents=True, exist_ok=True)

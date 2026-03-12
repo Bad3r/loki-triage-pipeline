@@ -7,3 +7,6 @@ secondary_color: "#087e8b"
 accent_color: "#bfd7ea"
 disclaimer: "This report contains derived analysis from Loki scan evidence. Raw logs remain the authoritative source of truth."
 redaction_note: "Paths and analyst notes may be summarized or partially redacted in the executive sections."
+top_findings_limit: 20
+appendix_host_limit: 25
+appendix_findings_per_host: 10
