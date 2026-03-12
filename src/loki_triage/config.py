@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,11 @@ _CONFIG_FILES = {
     "report_config": "report_config.yaml",
     "vt_config": "vt_config.yaml",
 }
+
+_REPORT_CONFIG_ENV_OVERRIDES = (
+    ("LOKI_TRIAGE_PROJECT_NAME", "organization_name"),
+    ("LOKI_TRIAGE_ORGANIZATION_NAME", "organization_name"),
+)
 
 
 def discover_project_root(start: Path | None = None) -> Path:
@@ -82,8 +89,57 @@ def load_yaml_file(path: Path) -> dict[str, Any]:
     return data
 
 
+def _parse_dotenv_value(raw_value: str) -> str:
+    value = raw_value.strip()
+    if not value:
+        return ""
+    if value[0] in {'"', "'"}:
+        try:
+            parsed = ast.literal_eval(value)
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError(f"Invalid quoted .env value: {raw_value!r}") from exc
+        if not isinstance(parsed, str):
+            raise ValueError(f"Expected string .env value, got {type(parsed).__name__}")
+        return parsed
+    return value.split(" #", 1)[0].rstrip()
+
+
+def load_dotenv_file(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[7:].lstrip()
+            key, separator, raw_value = stripped.partition("=")
+            if not separator:
+                raise ValueError(f"Invalid .env assignment at {path}:{line_number}")
+            env_key = key.strip()
+            if not env_key:
+                raise ValueError(f"Empty .env key at {path}:{line_number}")
+            values[env_key] = _parse_dotenv_value(raw_value)
+    return values
+
+
+def _resolve_report_config(paths: ProjectPaths, report_config: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(report_config)
+    dotenv_values = load_dotenv_file(paths.root / ".env")
+    for env_key, config_key in _REPORT_CONFIG_ENV_OVERRIDES:
+        env_value = os.environ.get(env_key)
+        if env_value is None:
+            env_value = dotenv_values.get(env_key)
+        if env_value:
+            resolved[config_key] = env_value
+    return resolved
+
+
 def load_runtime_config(paths: ProjectPaths) -> RuntimeConfig:
     loaded = {
         key: load_yaml_file(paths.config_dir / filename) for key, filename in _CONFIG_FILES.items()
     }
+    loaded["report_config"] = _resolve_report_config(paths, loaded["report_config"])
     return RuntimeConfig(**loaded)

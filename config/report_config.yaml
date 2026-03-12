@@ -1,4 +1,4 @@
-organization_name: ""
+# Set LOKI_TRIAGE_PROJECT_NAME in `.env` or the process environment to brand reports.
 report_title: "Loki Monthly Threat Triage"
 subtitle: "Executive summary and technical appendix"
 logo_path: ""
