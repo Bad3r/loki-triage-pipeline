@@ -1,4 +1,10 @@
 profile: public_safe
+daily_request_limit: 1000
+eligible_severities:
+  - NOTICE
+  - WARNING
+  - ERROR
+  - ALERT
 profiles:
   public_safe:
     batch_size: 4
@@ -16,7 +22,7 @@ profiles:
       - last_submission_date
       - last_analysis_date
   private_fast:
-    batch_size: 20
+    batch_size: 100
     sleep_seconds: 2
     include_fields:
       - "**"
