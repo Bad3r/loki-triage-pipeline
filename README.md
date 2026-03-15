@@ -27,7 +27,7 @@ uv run loki-triage report build --period 2026-01
 - Active config files under `config/`:
   - `severity_rules.yaml`: queueing and priority rules
   - `triage_policy.yaml`: deterministic allowlists and VT follow-up thresholds
-  - `vt_config.yaml`: active VT profile, daily request budget, eligible severities, batch size, sleep interval, and included fields
+  - `vt_config.yaml`: active VT profile, UTC daily request budget, eligible severities and dispositions, batch size, sleep interval, and included fields
   - `report_config.yaml`: report title, colors, disclaimer text, and appendix limits
   - `false_positive_rules.yaml`: legacy placeholder config, currently loaded but not enforced by runtime logic
 - `.env` and process environment:
@@ -53,14 +53,16 @@ uv run loki-triage report build --period 2026-01
 
 ## Notes
 - VT enrichment uses batched threaded `vt file --format json <hash...>` lookups only. The project does not upload files.
-- `config/vt_config.yaml` currently documents a `daily_request_limit` of `1000`. This is the operational planning ceiling for the current VT key; the runtime does not enforce that quota yet.
+- `config/vt_config.yaml -> daily_request_limit` is enforced at runtime as a UTC per-profile VT budget. Current repo default is `1000`.
 - VT lookup scope is limited by `vt_config.yaml -> eligible_severities`, currently `NOTICE`, `WARNING`, `ERROR`, and `ALERT`. `INFO` and `RESULT` findings are not sent to VT.
+- VT lookup scope is also limited by `vt_config.yaml -> eligible_dispositions`, currently `unreviewed`, `needs_followup`, and `true_positive`. Reviewed benign states such as `expected_benign` and `false_positive` do not consume VT quota by default.
 - VT lookup states are:
   - `ok`: VT returned a record and the cached summary is available
   - `not_found`: VT lookup completed but VT had no public record for the hash
   - `error`: VT invocation failed or returned an unparseable unexpected response
   - `missing`: no lookup row exists yet for that hash/profile
 - The active VT profile is currently `public_safe`. `private_fast` remains available for faster batch lookups when the configured VT quota supports it.
+- `loki-triage enrich-vt` now ranks pending hashes before lookup and returns a quota summary including `used_today`, `remaining_budget`, `candidate_count`, `selected_count`, and `deferred_count`.
 - Export behavior:
   - default export scope is `cases`
   - output path is `runs/<period>/<run_id>/exports/`

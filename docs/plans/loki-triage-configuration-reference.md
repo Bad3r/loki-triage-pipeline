@@ -34,13 +34,17 @@ This document lists every runtime configuration file loaded by `src/loki_triage/
 
 ## `config/vt_config.yaml`
 - `profile`: active VT profile name. Runtime fallback is `public_safe`. Current repo default is `public_safe`; `private_fast` remains available when the VT quota supports it.
-- `daily_request_limit`: operator-planning ceiling for the current VT key. Current repo value is `1000`. This is documented config today, not an enforced runtime stop.
+- `daily_request_limit`: enforced UTC per-profile VT budget. Current repo value is `1000`.
 - `eligible_severities[]`: Loki severities allowed into VT enrichment. Current repo default is `NOTICE`, `WARNING`, `ERROR`, `ALERT`.
+- `eligible_dispositions[]`: case dispositions allowed into VT enrichment. Current repo default is `unreviewed`, `needs_followup`, and `true_positive`.
 - `profiles.<name>.batch_size`: number of hashes submitted before sleeping.
 - `profiles.<name>.sleep_seconds`: sleep duration between batches.
 - `profiles.<name>.include_fields[]`: repeated `vt file -i <field>` selectors.
 - Runtime lookup behavior:
   - only hash-bearing case occurrences whose severity appears in `eligible_severities[]` are eligible for VT enrichment
+  - only cases whose current disposition appears in `eligible_dispositions[]` are eligible for VT enrichment
+  - the runtime counts same-day lookups in `vt_lookups.lookup_ts` for the active profile and stops once `daily_request_limit` is exhausted
+  - pending eligible hashes are ranked before lookup by disposition, priority, maximum observed score, host spread, occurrence count, recency, then SHA-256
   - one threaded `vt file` call is issued per configured batch
   - the runtime uses up to 20 VT CLI worker threads per batch
   - returned hashes are stored as `result_status='ok'`
@@ -48,6 +52,7 @@ This document lists every runtime configuration file loaded by `src/loki_triage/
   - nonzero VT exits or unexpected non-JSON output are stored as `result_status='error'`
 - Runtime fallback:
   - missing profile => `ValueError`
+  - missing `daily_request_limit` => `0`
   - missing `batch_size` => `1`
   - missing `sleep_seconds` => `0`
   - missing `include_fields` => `["**"]`
