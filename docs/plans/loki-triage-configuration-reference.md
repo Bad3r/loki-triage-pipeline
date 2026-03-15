@@ -20,10 +20,13 @@ This document lists every runtime configuration file loaded by `src/loki_triage/
 - `allowlists.path_rule_patterns[]`:
   - required: `path_regex`
   - optional: `rule_key` as string or list, `host_regex`, `name`, `reason`, `disposition`, `severity`, `priority`
+  - matching is occurrence-aware for file cases, so path/rule filters are evaluated against real occurrence tuples instead of the single stored case path
 - `vt.malicious_threshold` and `vt.suspicious_threshold`: minimum VT counts that trigger `vt_followup_disposition`.
 - `examples.*`: illustrative only; ignored by the evaluator.
 - Active default allowlists in the repo:
-  - archived `loki_*.log` outputs on disk
+  - archived `loki_*.(log|txt)` outputs on disk
+  - Favorites `.url` shortcut findings routed for separate URL review with `route-*` policy names
+  - proven packaged software sample/static families such as WinRAR defaults, Office samples, Adobe templates, and HP Sure Click browser stubs
   - `RemComSvc.exe` only at `C:\Windows\System32\RemComSvc.exe` or `C:\Windows\SysWOW64\RemComSvc.exe`
   - known Intel XTU binaries only under `C:\Windows\System32\DriverStore\FileRepository\xtucomponent.inf_amd64_*`
 - Runtime precedence:
@@ -35,12 +38,13 @@ This document lists every runtime configuration file loaded by `src/loki_triage/
 ## `config/vt_config.yaml`
 - `profile`: active VT profile name. Runtime fallback is `public_safe`. Current repo default is `public_safe`; `private_fast` remains available when the VT quota supports it.
 - `daily_request_limit`: operator-planning ceiling for the current VT key. Current repo value is `1000`. This is documented config today, not an enforced runtime stop.
-- `eligible_severities[]`: Loki severities allowed into VT enrichment. Current repo default is `NOTICE`, `WARNING`, `ERROR`, `ALERT`.
+- `eligible_severities[]`: Loki severities allowed into VT enrichment. Current repo default is `WARNING`, `ERROR`, `ALERT`.
 - `profiles.<name>.batch_size`: number of hashes submitted before sleeping.
 - `profiles.<name>.sleep_seconds`: sleep duration between batches.
 - `profiles.<name>.include_fields[]`: repeated `vt file -i <field>` selectors.
 - Runtime lookup behavior:
   - only hash-bearing case occurrences whose severity appears in `eligible_severities[]` are eligible for VT enrichment
+  - cases already classified as `expected_benign` or `false_positive` are skipped before VT lookup
   - one threaded `vt file` call is issued per configured batch
   - the runtime uses up to 20 VT CLI worker threads per batch
   - returned hashes are stored as `result_status='ok'`
@@ -81,6 +85,7 @@ This document lists every runtime configuration file loaded by `src/loki_triage/
   - `appendix_host_limit` default fallback `25`
   - `appendix_findings_per_host` default fallback `10`
 - `logo_path` is present in config but is not currently rendered by the report template.
+- report rendering now separates actionable findings, routed URL-review items, and suppressed benign summaries without introducing new dispositions.
 
 ## `config/false_positive_rules.yaml`
 - Loaded into `RuntimeConfig`, but currently unused by ingest, policy, review, reporting, and VT code paths.

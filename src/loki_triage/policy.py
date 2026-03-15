@@ -86,6 +86,19 @@ def _case_context(conn, case_id: int, lookup_profile: str) -> dict[str, Any]:
     payload["hosts"] = {
         item for item in str(payload.get("hosts") or "").split(",") if item
     }
+    occurrence_rows = conn.execute(
+        """
+        SELECT DISTINCT
+            fo.host,
+            fo.artifact_path,
+            fo.rule_key
+        FROM case_memberships cm
+        JOIN finding_occurrences fo ON fo.finding_id = cm.finding_id
+        WHERE cm.case_id = ?
+        """,
+        (case_id,),
+    ).fetchall()
+    payload["occurrences"] = [dict(row) for row in occurrence_rows]
     if payload.get("vt_summary_json"):
         payload["vt_summary"] = json.loads(str(payload["vt_summary_json"]))
     else:
@@ -128,6 +141,25 @@ def _matches_hosts(host_regex: str | None, hosts: set[str]) -> bool:
     return any(pattern.search(host) for host in hosts)
 
 
+def _matches_occurrence_rule(rule_filters: Any, rule_key: str | None) -> bool:
+    if not rule_filters:
+        return True
+    normalized_rule = canonical_key(str(rule_key or ""))
+    if isinstance(rule_filters, str):
+        return normalized_rule == canonical_key(rule_filters)
+    if isinstance(rule_filters, list):
+        return normalized_rule in {canonical_key(str(item)) for item in rule_filters}
+    return False
+
+
+def _matches_occurrence_host(host_regex: str | None, host: str | None) -> bool:
+    if not host_regex:
+        return True
+    if not host:
+        return False
+    return re.search(host_regex, host) is not None
+
+
 
 def _match_allowlist(case_row: dict[str, Any], triage_policy: dict[str, Any]) -> dict[str, Any] | None:
     allowlists = triage_policy.get("allowlists", {}) if isinstance(triage_policy, dict) else {}
@@ -147,22 +179,26 @@ def _match_allowlist(case_row: dict[str, Any], triage_policy: dict[str, Any]) ->
 
     for entry in _iter_entries(allowlists.get("path_rule_patterns")):
         path_regex = entry.get("path_regex")
-        artifact_path = str(case_row.get("artifact_path") or "")
-        if not path_regex or not artifact_path:
+        if not path_regex:
             continue
-        if not re.search(str(path_regex), artifact_path):
-            continue
-        if not _matches_rules(entry.get("rule_key"), case_row["rule_keys"]):
-            continue
-        if not _matches_hosts(entry.get("host_regex"), case_row["hosts"]):
-            continue
-        return {
-            "disposition": str(entry.get("disposition", expected_benign)),
-            "reason": str(entry.get("reason") or entry.get("name") or "Matched local path allowlist"),
-            "policy_name": str(entry.get("name") or "path-rule-allowlist"),
-            "severity": entry.get("severity"),
-            "priority": entry.get("priority"),
-        }
+        pattern = re.compile(str(path_regex))
+        for occurrence in case_row.get("occurrences", []):
+            artifact_path = str(occurrence.get("artifact_path") or "")
+            if not artifact_path:
+                continue
+            if not pattern.search(artifact_path):
+                continue
+            if not _matches_occurrence_rule(entry.get("rule_key"), occurrence.get("rule_key")):
+                continue
+            if not _matches_occurrence_host(entry.get("host_regex"), occurrence.get("host")):
+                continue
+            return {
+                "disposition": str(entry.get("disposition", expected_benign)),
+                "reason": str(entry.get("reason") or entry.get("name") or "Matched local path allowlist"),
+                "policy_name": str(entry.get("name") or "path-rule-allowlist"),
+                "severity": entry.get("severity"),
+                "priority": entry.get("priority"),
+            }
     return None
 
 

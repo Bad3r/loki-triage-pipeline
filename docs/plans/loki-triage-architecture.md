@@ -32,10 +32,11 @@ Build a CLI-first Python project that ingests raw Loki scan evidence, reconstruc
 - `ingest`: parse and store evidence, write normalized artifacts.
 - `enrich-vt`: look up unseen hashes and cache responses.
 - `review queue`: inspect current case-centric triage backlog.
+- `review queue --bucket`: switch between actionable, routed, suppressed, and all case views.
 - `review show`: inspect one analyst case, its child rules, and its occurrences.
 - `review set`: append a case verdict and update current status.
-- `export findings`: emit case-summary or raw-detection CSV/JSONL.
-- `report build`: write HTML and PDF output and guard against zero VT coverage unless explicitly bypassed.
+- `export findings --bucket`: emit actionable, routed, suppressed, or full case/raw exports.
+- `report build`: write HTML and PDF output and guard against zero VT coverage for actionable hash-bearing cases unless explicitly bypassed.
 
 ## Loki-native vs local policy
 Use Loki-native controls for suppression when possible:
@@ -52,15 +53,17 @@ Use local YAML for:
 - VT quota profiles
 
 ## Active local policy scope
-- Current repo policy keeps automatic benigning intentionally narrow.
+- Current repo policy keeps automatic benigning deterministic and routes known non-VT URL findings separately.
 - Active allowlists cover:
-  - archived `loki_*.log` artifacts retained on disk
+  - archived `loki_*.(log|txt)` artifacts retained on disk
+  - Favorites `.url` shortcut hits routed for separate URL review
+  - packaged software sample/static families proven to be deterministic noise in the baseline corpus
   - `RemComSvc.exe` only in `C:\Windows\System32\RemComSvc.exe` or `C:\Windows\SysWOW64\RemComSvc.exe`
   - approved Intel XTU binaries only under `C:\Windows\System32\DriverStore\FileRepository\xtucomponent.inf_amd64_*`
-- VT enrichment can raise `needs_followup`, but deterministic local policy is the only path to automatic benign classification.
+- VT enrichment can raise `needs_followup`, but deterministic local policy is the only path to automatic benign classification or routed non-VT review.
 
 ## Report guardrails
-- Report generation fails when scoped hash-bearing cases have zero VT coverage unless `--allow-missing-vt` is supplied.
+- Report generation fails when scoped actionable hash-bearing cases have zero VT coverage unless `--allow-missing-vt` is supplied.
 - Report generation also fails when the requested scope includes legacy runs with `finding_occurrences` but no corresponding `case_occurrences`.
 - Legacy state must be rebuilt from raw logs before case-centric period reports are trustworthy.
 
