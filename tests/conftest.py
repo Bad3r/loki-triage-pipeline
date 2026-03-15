@@ -12,6 +12,7 @@ CONFIG_FILES = [
     "severity_rules.yaml",
     "false_positive_rules.yaml",
     "report_config.yaml",
+    "triage_policy.yaml",
     "vt_config.yaml",
 ]
 

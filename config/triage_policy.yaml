@@ -1,0 +1,36 @@
+# Conservative default posture:
+# - only deterministic local policy may auto-mark expected_benign
+# - VT can raise needs_followup but cannot suppress on its own
+
+defaults:
+  expected_benign_disposition: expected_benign
+  vt_followup_disposition: needs_followup
+
+allowlists:
+  sha256: []
+  path_rule_patterns:
+    - name: approved-archived-loki-output
+      rule_key: id_133015
+      path_regex: '(?i)(?:^|[\\/])loki_[^\\/]+\.log$'
+      reason: Historical Loki output retained on disk
+    - name: approved-remcom-service
+      rule_key:
+        - remcom_remotecommandexecution
+        - id_83692
+      path_regex: '(?i)^c:\\windows\\(?:system32|syswow64)\\remcomsvc\.exe$'
+      reason: Approved RemCom service in the default Windows service path
+    - name: approved-intel-xtu-driverstore
+      rule_key:
+        - susp_net_name_confuserex
+        - id_144731
+      path_regex: '(?i)^c:\\windows\\system32\\driverstore\\filerepository\\xtucomponent\.inf_amd64_[^\\]+\\(?:common\.dll|hardwareaccess\.dll|hardwareaccessinterfaces\.dll|hardwareservices\.dll|intelbenchmarksdk\.dll|inteloverclockingsdk\.dll|platformdetection\.dll|profilehelpermodel\.dll|xtuapplication\.dll|xtuapplicationinterfaces\.dll|xtucommon\.dll|xtucoreserver\.dll|xtuinterface\.dll|xtuservice\.exe)$'
+      reason: Approved Intel XTU DriverStore component in the default driver path
+
+vt:
+  malicious_threshold: 1
+  suspicious_threshold: 1
+
+examples:
+  sha256:
+    - sha256: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+      reason: Example exact-hash allowlist entry

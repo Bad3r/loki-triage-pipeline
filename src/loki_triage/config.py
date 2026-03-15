@@ -26,6 +26,7 @@ class RuntimeConfig:
     severity_rules: dict[str, Any]
     false_positive_rules: dict[str, Any]
     report_config: dict[str, Any]
+    triage_policy: dict[str, Any]
     vt_config: dict[str, Any]
 
 
@@ -33,6 +34,7 @@ _CONFIG_FILES = {
     "severity_rules": "severity_rules.yaml",
     "false_positive_rules": "false_positive_rules.yaml",
     "report_config": "report_config.yaml",
+    "triage_policy": "triage_policy.yaml",
     "vt_config": "vt_config.yaml",
 }
 

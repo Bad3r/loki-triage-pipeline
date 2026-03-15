@@ -115,6 +115,69 @@ CREATE TABLE IF NOT EXISTS analyst_verdicts (
     run_id TEXT REFERENCES scan_runs(id)
 );
 
+CREATE TABLE IF NOT EXISTS cases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_key TEXT NOT NULL UNIQUE,
+    entity_type TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    context_fingerprint TEXT,
+    sha256 TEXT,
+    md5 TEXT,
+    artifact_path TEXT,
+    title TEXT NOT NULL,
+    observed_severity TEXT NOT NULL,
+    observed_priority TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    priority TEXT NOT NULL,
+    current_disposition TEXT NOT NULL DEFAULT 'unreviewed',
+    current_reason TEXT,
+    disposition_source TEXT NOT NULL DEFAULT 'default',
+    policy_name TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    first_run_id TEXT NOT NULL REFERENCES scan_runs(id),
+    last_run_id TEXT NOT NULL REFERENCES scan_runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS case_memberships (
+    case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    finding_id INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    UNIQUE(case_id, finding_id)
+);
+
+CREATE TABLE IF NOT EXISTS case_occurrences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    event_id INTEGER NOT NULL REFERENCES normalized_events(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+    host TEXT,
+    occurrence_ts TEXT,
+    severity TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_kind TEXT,
+    artifact_path TEXT,
+    sha256 TEXT,
+    context_fingerprint TEXT,
+    state_for_host_run TEXT,
+    score INTEGER,
+    source_path TEXT NOT NULL,
+    source_line_start INTEGER NOT NULL,
+    source_line_end INTEGER NOT NULL,
+    UNIQUE(case_id, event_id)
+);
+
+CREATE TABLE IF NOT EXISTS case_verdicts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    decision_ts TEXT NOT NULL,
+    disposition TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    analyst TEXT NOT NULL,
+    run_id TEXT REFERENCES scan_runs(id),
+    source TEXT NOT NULL DEFAULT 'analyst'
+);
+
 CREATE TABLE IF NOT EXISTS vt_lookups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sha256 TEXT NOT NULL,
@@ -144,6 +207,13 @@ CREATE INDEX IF NOT EXISTS idx_findings_sha256 ON findings(sha256);
 CREATE INDEX IF NOT EXISTS idx_occurrences_run_host ON finding_occurrences(run_id, host);
 CREATE INDEX IF NOT EXISTS idx_occurrences_finding ON finding_occurrences(finding_id);
 CREATE INDEX IF NOT EXISTS idx_verdicts_finding_ts ON analyst_verdicts(finding_id, decision_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_cases_sha256 ON cases(sha256);
+CREATE INDEX IF NOT EXISTS idx_cases_identity ON cases(scope, identity_value);
+CREATE INDEX IF NOT EXISTS idx_case_memberships_case ON case_memberships(case_id);
+CREATE INDEX IF NOT EXISTS idx_case_memberships_finding ON case_memberships(finding_id);
+CREATE INDEX IF NOT EXISTS idx_case_occurrences_run_host ON case_occurrences(run_id, host);
+CREATE INDEX IF NOT EXISTS idx_case_occurrences_case ON case_occurrences(case_id);
+CREATE INDEX IF NOT EXISTS idx_case_verdicts_case_ts ON case_verdicts(case_id, decision_ts DESC);
 """
 
 
@@ -357,6 +427,120 @@ def insert_occurrence(conn: sqlite3.Connection, payload: dict[str, Any]) -> int:
 
 
 
+def upsert_case(conn: sqlite3.Connection, payload: dict[str, Any]) -> int:
+    row = conn.execute("SELECT * FROM cases WHERE case_key = ?", (payload["case_key"],)).fetchone()
+    if row:
+        new_observed_severity = higher_severity(str(row["observed_severity"]), payload["observed_severity"])
+        new_observed_priority = higher_priority(str(row["observed_priority"]), payload["observed_priority"])
+        new_effective_severity = higher_severity(str(row["severity"]), payload["observed_severity"])
+        new_effective_priority = higher_priority(str(row["priority"]), payload["observed_priority"])
+        conn.execute(
+            """
+            UPDATE cases
+            SET artifact_path = COALESCE(artifact_path, ?),
+                sha256 = COALESCE(sha256, ?),
+                md5 = COALESCE(md5, ?),
+                context_fingerprint = COALESCE(context_fingerprint, ?),
+                observed_severity = ?,
+                observed_priority = ?,
+                severity = ?,
+                priority = ?,
+                last_seen_at = ?,
+                last_run_id = ?
+            WHERE id = ?
+            """,
+            (
+                payload.get("artifact_path"),
+                payload.get("sha256"),
+                payload.get("md5"),
+                payload.get("context_fingerprint"),
+                new_observed_severity,
+                new_observed_priority,
+                new_effective_severity,
+                new_effective_priority,
+                payload["seen_at"],
+                payload["run_id"],
+                row["id"],
+            ),
+        )
+        return int(row["id"])
+    cursor = conn.execute(
+        """
+        INSERT INTO cases(
+            case_key, entity_type, scope, identity_value, context_fingerprint,
+            sha256, md5, artifact_path, title, observed_severity, observed_priority,
+            severity, priority, current_disposition, current_reason, disposition_source,
+            policy_name, first_seen_at, last_seen_at, first_run_id, last_run_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload["case_key"],
+            payload["entity_type"],
+            payload["scope"],
+            payload["identity_value"],
+            payload.get("context_fingerprint"),
+            payload.get("sha256"),
+            payload.get("md5"),
+            payload.get("artifact_path"),
+            payload["title"],
+            payload["observed_severity"],
+            payload["observed_priority"],
+            payload["observed_severity"],
+            payload["observed_priority"],
+            payload.get("current_disposition", "unreviewed"),
+            payload.get("current_reason"),
+            payload.get("disposition_source", "default"),
+            payload.get("policy_name"),
+            payload["seen_at"],
+            payload["seen_at"],
+            payload["run_id"],
+            payload["run_id"],
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+
+def insert_case_membership(conn: sqlite3.Connection, case_id: int, finding_id: int) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO case_memberships(case_id, finding_id) VALUES (?, ?)",
+        (case_id, finding_id),
+    )
+
+
+
+def insert_case_occurrence(conn: sqlite3.Connection, payload: dict[str, Any]) -> int:
+    cursor = conn.execute(
+        """
+        INSERT OR IGNORE INTO case_occurrences(
+            case_id, event_id, run_id, host, occurrence_ts, severity, event_type,
+            event_kind, artifact_path, sha256, context_fingerprint, state_for_host_run,
+            score, source_path, source_line_start, source_line_end
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload["case_id"],
+            payload["event_id"],
+            payload["run_id"],
+            payload.get("host"),
+            payload.get("occurrence_ts"),
+            payload["severity"],
+            payload["event_type"],
+            payload.get("event_kind"),
+            payload.get("artifact_path"),
+            payload.get("sha256"),
+            payload.get("context_fingerprint"),
+            payload.get("state_for_host_run"),
+            payload.get("score"),
+            payload["source_path"],
+            payload["source_line_start"],
+            payload["source_line_end"],
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+
 def record_verdict(
     conn: sqlite3.Connection,
     finding_id: int,
@@ -377,6 +561,94 @@ def record_verdict(
         "UPDATE findings SET current_disposition = ?, current_reason = ? WHERE id = ?",
         (disposition, reason, finding_id),
     )
+
+
+
+def sync_case_disposition_to_findings(conn: sqlite3.Connection, case_id: int) -> None:
+    case_row = conn.execute(
+        "SELECT current_disposition, current_reason FROM cases WHERE id = ?",
+        (case_id,),
+    ).fetchone()
+    if case_row is None:
+        return
+    conn.execute(
+        """
+        UPDATE findings
+        SET current_disposition = ?, current_reason = ?
+        WHERE id IN (SELECT finding_id FROM case_memberships WHERE case_id = ?)
+        """,
+        (case_row["current_disposition"], case_row["current_reason"], case_id),
+    )
+
+
+
+def set_case_state(
+    conn: sqlite3.Connection,
+    case_id: int,
+    disposition: str,
+    reason: str | None,
+    source: str,
+    policy_name: str | None = None,
+    severity: str | None = None,
+    priority: str | None = None,
+) -> None:
+    case_row = conn.execute(
+        "SELECT observed_severity, observed_priority FROM cases WHERE id = ?",
+        (case_id,),
+    ).fetchone()
+    if case_row is None:
+        raise KeyError(f"Case {case_id} was not found")
+    effective_severity = severity or str(case_row["observed_severity"])
+    effective_priority = priority or str(case_row["observed_priority"])
+    conn.execute(
+        """
+        UPDATE cases
+        SET current_disposition = ?, current_reason = ?, disposition_source = ?, policy_name = ?,
+            severity = ?, priority = ?
+        WHERE id = ?
+        """,
+        (disposition, reason, source, policy_name, effective_severity, effective_priority, case_id),
+    )
+    sync_case_disposition_to_findings(conn, case_id)
+
+
+
+def record_case_verdict(
+    conn: sqlite3.Connection,
+    case_id: int,
+    disposition: str,
+    reason: str,
+    analyst: str,
+    run_id: str | None = None,
+    source: str = "analyst",
+) -> None:
+    decision_ts = utc_now()
+    conn.execute(
+        """
+        INSERT INTO case_verdicts(case_id, decision_ts, disposition, reason, analyst, run_id, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (case_id, decision_ts, disposition, reason, analyst, run_id, source),
+    )
+    set_case_state(conn, case_id, disposition, reason, source, None)
+
+
+
+def case_ids_for_run(conn: sqlite3.Connection, run_id: str) -> list[int]:
+    rows = conn.execute(
+        "SELECT DISTINCT case_id FROM case_occurrences WHERE run_id = ? ORDER BY case_id",
+        (run_id,),
+    ).fetchall()
+    return [int(row["case_id"]) for row in rows]
+
+
+
+def case_ids_for_sha(conn: sqlite3.Connection, sha256: str) -> list[int]:
+    rows = conn.execute(
+        "SELECT id FROM cases WHERE sha256 = ? ORDER BY id",
+        (sha256,),
+    ).fetchall()
+    return [int(row["id"]) for row in rows]
 
 
 
