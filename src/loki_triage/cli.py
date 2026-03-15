@@ -6,22 +6,23 @@ from typing import Annotated
 
 import typer
 
-from .ingest import export_rows_for_run, ingest_logs
-from .review import queue_table, set_finding_verdict, show_finding
-from .reporting import build_report
-from .utils import format_table, write_csv
-from .vt import enrich_hashes
 from .config import get_project_paths
 from .db import connect, ensure_schema
+from .ingest import export_case_rows_for_run, export_raw_rows_for_run, ingest_logs
+from .reporting import build_report
+from .review import queue_table, set_case_verdict, show_case
+from .utils import format_table, write_csv
+from .vt import enrich_hashes
 
 
 app = typer.Typer(help="Loki log ingestion, triage, enrichment, and reporting")
-review_app = typer.Typer(help="Inspect and disposition findings")
-export_app = typer.Typer(help="Export run-scoped finding data")
+review_app = typer.Typer(help="Inspect and disposition analyst cases")
+export_app = typer.Typer(help="Export run-scoped case or raw detection data")
 report_app = typer.Typer(help="Build HTML and PDF reports")
 app.add_typer(review_app, name="review")
 app.add_typer(export_app, name="export")
 app.add_typer(report_app, name="report")
+
 
 
 def _run_period(conn, run_id: str) -> str:
@@ -64,14 +65,14 @@ def review_queue(
 
 
 @review_app.command("show")
-def review_show(finding_id: Annotated[int, typer.Argument(help="Finding identifier")]) -> None:
-    payload = show_finding(finding_id)
+def review_show(case_id: Annotated[int, typer.Argument(help="Case identifier")]) -> None:
+    payload = show_case(case_id)
     typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 @review_app.command("set")
 def review_set(
-    finding_id: Annotated[int, typer.Argument(help="Finding identifier")],
+    case_id: Annotated[int, typer.Argument(help="Case identifier")],
     disposition: Annotated[
         str,
         typer.Option(
@@ -83,34 +84,36 @@ def review_set(
     analyst: Annotated[str, typer.Option("--analyst", help="Analyst name or handle")] = "local-analyst",
     run_id: Annotated[str | None, typer.Option("--run-id", help="Optional related run id")] = None,
 ) -> None:
-    set_finding_verdict(finding_id, disposition, reason, analyst, run_id)
-    typer.echo(f"Updated finding {finding_id} to {disposition}")
+    set_case_verdict(case_id, disposition, reason, analyst, run_id)
+    typer.echo(f"Updated case {case_id} to {disposition}")
 
 
 @export_app.command("findings")
 def export_findings(
     run_id: Annotated[str, typer.Option("--run-id", help="Run identifier to export")],
     format: Annotated[str, typer.Option("--format", help="csv or jsonl")] = "csv",
+    scope: Annotated[str, typer.Option("--scope", help="cases or raw")] = "cases",
 ) -> None:
     paths = get_project_paths()
     conn = connect(paths.db_path)
     ensure_schema(conn)
     try:
         period = _run_period(conn, run_id)
-        rows = export_rows_for_run(conn, run_id)
+        rows = export_case_rows_for_run(conn, run_id) if scope == "cases" else export_raw_rows_for_run(conn, run_id)
     finally:
         conn.close()
     output_dir = paths.runs_dir / period / run_id / "exports"
     output_dir.mkdir(parents=True, exist_ok=True)
+    stem = "cases" if scope == "cases" else "raw_detections"
     if format == "jsonl":
-        output_path = output_dir / "findings.jsonl"
+        output_path = output_dir / f"{stem}.jsonl"
         with output_path.open("w", encoding="utf-8") as handle:
             for row in rows:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str))
                 handle.write("\n")
     else:
-        output_path = output_dir / "findings.csv"
-        write_csv(output_path, rows, list(rows[0].keys()) if rows else ["finding_id"])
+        output_path = output_dir / f"{stem}.csv"
+        write_csv(output_path, rows, list(rows[0].keys()) if rows else ["case_id" if scope == "cases" else "finding_id"])
     typer.echo(str(output_path))
 
 
@@ -118,13 +121,22 @@ def export_findings(
 def report_build(
     period: Annotated[str, typer.Option("--period", help="Reporting period, for example 2026-01")],
     run_id: Annotated[str | None, typer.Option("--run-id", help="Optional run identifier")] = None,
+    allow_missing_vt: Annotated[
+        bool,
+        typer.Option("--allow-missing-vt", help="Build report even when scoped hash-bearing cases have zero VT coverage"),
+    ] = False,
 ) -> None:
-    result = build_report(period, run_id)
-    typer.echo(format_table([
-        {"artifact": "html", "path": result["html_path"]},
-        {"artifact": "pdf", "path": result["pdf_path"]},
-        {"artifact": "csv", "path": result["csv_path"]},
-    ], [("artifact", "Artifact"), ("path", "Path")]))
+    result = build_report(period, run_id, allow_missing_vt=allow_missing_vt)
+    typer.echo(
+        format_table(
+            [
+                {"artifact": "html", "path": result["html_path"]},
+                {"artifact": "pdf", "path": result["pdf_path"]},
+                {"artifact": "csv", "path": result["csv_path"]},
+            ],
+            [("artifact", "Artifact"), ("path", "Path")],
+        )
+    )
 
 
 if __name__ == "__main__":
