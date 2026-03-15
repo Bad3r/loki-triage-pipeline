@@ -36,25 +36,25 @@ uv run loki-triage report build --period 2026-01
   - current report template renders `report_title` and `subtitle`; `organization_name` is stored in runtime config for downstream consumers but is not currently printed in the HTML/PDF template
 - Triage policy highlights:
   - `allowlists.sha256`: exact hash allowlists
-  - `allowlists.path_rule_patterns`: path and rule-based allowlists with optional `host_regex`
+  - `allowlists.path_rule_patterns`: occurrence-aware path and rule-based allowlists with optional `host_regex`
   - `defaults.expected_benign_disposition` and `defaults.vt_followup_disposition`: disposition fallbacks
   - `vt.malicious_threshold` and `vt.suspicious_threshold`: when VT should raise `needs_followup`
-  - active path allowlists currently cover archived `loki_*.log` output, `RemComSvc.exe` in `System32|SysWOW64`, and known Intel XTU DriverStore binaries in the canonical `xtucomponent.inf_amd64_*` path
+  - active path rules currently cover archived `loki_*.(log|txt)` output, a routed Favorites `.url` shortcut bucket, packaged software sample/static families, `RemComSvc.exe` in `System32|SysWOW64`, and known Intel XTU DriverStore binaries in the canonical `xtucomponent.inf_amd64_*` path
   - analyst verdicts take precedence over automatic policy reevaluation
 
 ## Commands
 - `loki-triage ingest <paths...> --period YYYY-MM --run-kind baseline|rescan|mixed`
 - `loki-triage enrich-vt --run-id <id>`
-- `loki-triage review queue [--status ...]`
+- `loki-triage review queue [--status ...] [--bucket actionable|routed|suppressed|all]`
 - `loki-triage review show <case-id>`
 - `loki-triage review set <case-id> --disposition ... --reason ...`
-- `loki-triage export findings --run-id <id> --scope cases|raw --format csv|jsonl`
+- `loki-triage export findings --run-id <id> --scope cases|raw --format csv|jsonl [--bucket actionable|routed|suppressed|all]`
 - `loki-triage report build --period YYYY-MM [--run-id ...] [--allow-missing-vt]`
 
 ## Notes
 - VT enrichment uses batched threaded `vt file --format json <hash...>` lookups only. The project does not upload files.
 - `config/vt_config.yaml` currently documents a `daily_request_limit` of `1000`. This is the operational planning ceiling for the current VT key; the runtime does not enforce that quota yet.
-- VT lookup scope is limited by `vt_config.yaml -> eligible_severities`, currently `NOTICE`, `WARNING`, `ERROR`, and `ALERT`. `INFO` and `RESULT` findings are not sent to VT.
+- VT lookup scope is limited by `vt_config.yaml -> eligible_severities`, currently `WARNING`, `ERROR`, and `ALERT`. `NOTICE`, `INFO`, and `RESULT` findings are not sent to VT by default.
 - VT lookup states are:
   - `ok`: VT returned a record and the cached summary is available
   - `not_found`: VT lookup completed but VT had no public record for the hash
@@ -67,14 +67,12 @@ uv run loki-triage report build --period 2026-01
   - case exports are `cases.csv|jsonl`
   - raw detection exports are `raw_detections.csv|jsonl`
 - Report generation fails by default when:
-  - scoped hash-bearing cases have zero VT coverage
+  - scoped actionable hash-bearing cases have zero VT coverage
   - the report scope mixes legacy runs that only have `finding_occurrences` with rebuilt runs that have `case_occurrences`
   - use `--allow-missing-vt` only when you explicitly want a non-enriched report and already understand the coverage gap
 - Analyst review is case-centric. Multiple Loki `REASON_n` matches for the same artifact collapse into one case with child rule evidence.
-- Local auto-triage policy lives in `config/triage_policy.yaml`. Deterministic allowlists may mark cases `expected_benign`; VT can raise `needs_followup` but does not auto-suppress on its own.
-- Active benign path rules are intentionally narrow:
-  - `C:\Windows\System32\RemComSvc.exe` and `C:\Windows\SysWOW64\RemComSvc.exe` for the RemCom service signature family
-  - known Intel XTU binaries only under `C:\Windows\System32\DriverStore\FileRepository\xtucomponent.inf_amd64_*`
+- Local auto-triage policy lives in `config/triage_policy.yaml`. Deterministic allowlists may mark cases `expected_benign`, routed URL-review items are tagged with `route-*` policy names and stored as `false_positive`, and VT can raise `needs_followup` but does not auto-suppress on its own.
+- Review, export, and report surfaces now default to the actionable bucket. Routed and suppressed noise remains available on demand through `--bucket` filters and the report’s routed URL review section.
 - Existing pre-case `state/triage.db` contents should be treated as legacy derived state. Rebuild from raw logs after upgrading.
 - Rebuild runbook for legacy state:
   ```bash
