@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import json
 import re
 import subprocess
@@ -15,6 +16,7 @@ from .utils import chunked
 
 NOT_FOUND_PATTERN = re.compile(r'^File "(?P<sha256>[A-Fa-f0-9]{32,64})" not found$', re.MULTILINE)
 DEFAULT_VT_ENRICHMENT_SEVERITIES = ("NOTICE", "WARNING", "ERROR", "ALERT")
+DEFAULT_VT_ELIGIBLE_DISPOSITIONS = ("unreviewed", "needs_followup", "true_positive")
 
 
 
@@ -38,32 +40,124 @@ def _eligible_severities(runtime_config: RuntimeConfig) -> tuple[str, ...]:
 
 
 
-def _pending_hashes(conn, profile_name: str, eligible_severities: tuple[str, ...], run_id: str | None = None) -> list[str]:
+def _eligible_dispositions(runtime_config: RuntimeConfig) -> tuple[str, ...]:
+    configured = runtime_config.vt_config.get("eligible_dispositions", DEFAULT_VT_ELIGIBLE_DISPOSITIONS)
+    if isinstance(configured, list):
+        values = tuple(str(item).strip().lower() for item in configured if str(item).strip())
+        if values:
+            return values
+    return DEFAULT_VT_ELIGIBLE_DISPOSITIONS
+
+
+
+def _daily_request_limit(runtime_config: RuntimeConfig) -> int:
+    configured = runtime_config.vt_config.get("daily_request_limit", 0)
+    try:
+        limit = int(configured)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("VT daily_request_limit must be an integer") from exc
+    if limit < 0:
+        raise ValueError("VT daily_request_limit must be >= 0")
+    return limit
+
+
+
+def _utc_today() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%d")
+
+
+
+def _used_budget_today(conn, profile_name: str, utc_day: str) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM vt_lookups
+        WHERE lookup_profile = ?
+          AND substr(lookup_ts, 1, 10) = ?
+        """,
+        (profile_name, utc_day),
+    ).fetchone()
+    return int(row["count"] or 0)
+
+
+
+def _pending_candidates(
+    conn,
+    profile_name: str,
+    eligible_severities: tuple[str, ...],
+    eligible_dispositions: tuple[str, ...],
+    run_id: str | None = None,
+) -> list[dict[str, Any]]:
     severity_placeholders = ",".join("?" for _ in eligible_severities)
-    params: list[Any] = [profile_name, *eligible_severities]
-    run_clause = ""
+    disposition_placeholders = ",".join("?" for _ in eligible_dispositions)
+    params: list[Any] = [profile_name, *eligible_dispositions, *eligible_severities]
+    exists_run_clause = ""
+    scoped_run_clause = ""
     if run_id:
-        run_clause = " AND co.run_id = ?"
+        exists_run_clause = " AND co.run_id = ?"
+        scoped_run_clause = " AND run_id = ?"
+        params.append(run_id)
+    params.extend(eligible_severities)
+    if run_id:
         params.append(run_id)
     rows = conn.execute(
         f"""
-        SELECT DISTINCT c.sha256
-        FROM cases c
-        LEFT JOIN vt_lookups v ON v.sha256 = c.sha256 AND v.lookup_profile = ?
-        WHERE c.sha256 IS NOT NULL
-          AND v.id IS NULL
-          AND EXISTS (
-              SELECT 1
-              FROM case_occurrences co
-              WHERE co.case_id = c.id
-                AND co.severity IN ({severity_placeholders})
-                {run_clause}
-          )
-        ORDER BY c.sha256 ASC
+        WITH pending_cases AS (
+            SELECT c.id AS case_id, c.sha256, c.current_disposition, c.priority
+            FROM cases c
+            LEFT JOIN vt_lookups v ON v.sha256 = c.sha256 AND v.lookup_profile = ?
+            WHERE c.sha256 IS NOT NULL
+              AND v.id IS NULL
+              AND lower(c.current_disposition) IN ({disposition_placeholders})
+              AND EXISTS (
+                  SELECT 1
+                  FROM case_occurrences co
+                  WHERE co.case_id = c.id
+                    AND co.severity IN ({severity_placeholders})
+                    {exists_run_clause}
+              )
+        ),
+        scoped_occurrences AS (
+            SELECT case_id, host, occurrence_ts, COALESCE(score, 0) AS score
+            FROM case_occurrences
+            WHERE severity IN ({severity_placeholders})
+              {scoped_run_clause}
+        )
+        SELECT
+            pc.sha256,
+            pc.current_disposition,
+            pc.priority,
+            MAX(so.score) AS max_score,
+            COUNT(DISTINCT so.host) AS host_count,
+            COUNT(*) AS occurrence_count,
+            MAX(COALESCE(so.occurrence_ts, '')) AS latest_occurrence_ts
+        FROM pending_cases pc
+        JOIN scoped_occurrences so ON so.case_id = pc.case_id
+        GROUP BY pc.case_id, pc.sha256, pc.current_disposition, pc.priority
+        ORDER BY
+            CASE lower(pc.current_disposition)
+                WHEN 'needs_followup' THEN 3
+                WHEN 'true_positive' THEN 2
+                WHEN 'unreviewed' THEN 1
+                ELSE 0
+            END DESC,
+            CASE lower(pc.priority)
+                WHEN 'critical' THEN 5
+                WHEN 'high' THEN 4
+                WHEN 'medium' THEN 3
+                WHEN 'low' THEN 2
+                WHEN 'info' THEN 1
+                ELSE 0
+            END DESC,
+            MAX(so.score) DESC,
+            COUNT(DISTINCT so.host) DESC,
+            COUNT(*) DESC,
+            MAX(COALESCE(so.occurrence_ts, '')) DESC,
+            pc.sha256 ASC
         """,
         params,
     ).fetchall()
-    return [str(row["sha256"]) for row in rows]
+    return [dict(row) for row in rows]
 
 
 
@@ -249,19 +343,50 @@ def enrich_hashes(run_id: str | None = None, project_root: Path | None = None) -
     runtime_config = load_runtime_config(project_paths)
     profile_name, profile = _select_profile(runtime_config)
     eligible_severities = _eligible_severities(runtime_config)
+    eligible_dispositions = _eligible_dispositions(runtime_config)
+    daily_request_limit = _daily_request_limit(runtime_config)
     conn = connect(project_paths.db_path)
     ensure_schema(conn)
     try:
-        hashes = _pending_hashes(conn, profile_name, eligible_severities, run_id)
-        if not hashes:
-            return {"profile": profile_name, "processed": 0, "summary": "No pending hashes"}
+        utc_day = _utc_today()
+        used_today = _used_budget_today(conn, profile_name, utc_day)
+        remaining_budget = max(daily_request_limit - used_today, 0)
+        candidates = _pending_candidates(conn, profile_name, eligible_severities, eligible_dispositions, run_id)
+        candidate_count = len(candidates)
+        selected_hashes = [str(candidate["sha256"]) for candidate in candidates[:remaining_budget]]
+        deferred_count = max(candidate_count - len(selected_hashes), 0)
+        base_result = {
+            "profile": profile_name,
+            "processed": 0,
+            "candidate_count": candidate_count,
+            "selected_count": len(selected_hashes),
+            "deferred_count": deferred_count,
+            "daily_request_limit": daily_request_limit,
+            "used_today": used_today,
+            "remaining_budget": remaining_budget,
+            "status_counts": {"ok": 0, "not_found": 0, "error": 0},
+            "errors": [],
+            "utc_day": utc_day,
+        }
+        if not candidates:
+            base_result["summary"] = (
+                f"No pending VT hashes for profile {profile_name} "
+                f"(used_today={used_today}/{daily_request_limit}, utc_day={utc_day})"
+            )
+            return base_result
+        if not selected_hashes:
+            base_result["summary"] = (
+                f"VT daily budget exhausted for profile {profile_name} on {utc_day} UTC "
+                f"(used_today={used_today}/{daily_request_limit}, deferred={deferred_count})"
+            )
+            return base_result
         processed = 0
         errors: list[str] = []
         status_counts = {"ok": 0, "not_found": 0, "error": 0}
         include_fields = list(profile.get("include_fields", ["**"]))
         sleep_seconds = float(profile.get("sleep_seconds", 0))
         batch_size = int(profile.get("batch_size", 1))
-        for group in chunked(hashes, batch_size):
+        for group in chunked(selected_hashes, batch_size):
             processed += _process_vt_group(
                 conn,
                 group,
@@ -272,16 +397,18 @@ def enrich_hashes(run_id: str | None = None, project_root: Path | None = None) -
                 status_counts,
             )
             conn.commit()
-            if sleep_seconds > 0 and processed < len(hashes):
+            if sleep_seconds > 0 and processed < len(selected_hashes):
                 time.sleep(sleep_seconds)
         return {
-            "profile": profile_name,
+            **base_result,
             "processed": processed,
             "status_counts": status_counts,
             "errors": errors,
+            "remaining_budget": max(daily_request_limit - used_today - processed, 0),
             "summary": (
-                f"Processed {processed} hashes with VT profile {profile_name} "
-                f"(ok={status_counts['ok']}, not_found={status_counts['not_found']}, error={status_counts['error']})"
+                f"Processed {processed} of {candidate_count} eligible hashes with VT profile {profile_name} "
+                f"(used_today={used_today + processed}/{daily_request_limit}, deferred={deferred_count}, "
+                f"ok={status_counts['ok']}, not_found={status_counts['not_found']}, error={status_counts['error']})"
             ),
         }
     finally:

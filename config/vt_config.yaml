@@ -5,6 +5,10 @@ eligible_severities:
   - WARNING
   - ERROR
   - ALERT
+eligible_dispositions:
+  - unreviewed
+  - needs_followup
+  - true_positive
 profiles:
   public_safe:
     batch_size: 4

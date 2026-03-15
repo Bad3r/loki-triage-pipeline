@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 import json
 import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from loki_triage.db import connect, ensure_schema, upsert_vt_lookup
 from loki_triage.ingest import ingest_logs
@@ -32,15 +34,67 @@ def _write_single_file_finding_log(
     severity: str = "ALERT",
     md5: str = "11111111111111111111111111111111",
     sha1: str = "2222222222222222222222222222222222222222",
+    score: int = 150,
 ) -> Path:
     payload = f"""20260105T00:00:00Z,{host},NOTICE,Init,Starting Loki Scan VERSION: 0.51.0 SYSTEM: {host} TIME: 20260105T00:00:00Z
-20260105T00:00:01Z,{host},{severity},FileScan,FILE: {artifact_path} SCORE: 150 TYPE: EXE SIZE: 10 FIRST_BYTES: 4d5a MD5: {md5} SHA1: {sha1} SHA256: {sha256} CREATED: Wed Jan  1 00:00:00 2026 MODIFIED: Wed Jan  1 00:00:00 2026 ACCESSED: Wed Jan  1 00:00:00 2026 REASON_1: Yara Rule MATCH: {rule_key} SUBSCORE: 70 DESCRIPTION: test hit REF: https://example.invalid AUTHOR: tester MATCHES:
+20260105T00:00:01Z,{host},{severity},FileScan,FILE: {artifact_path} SCORE: {score} TYPE: EXE SIZE: 10 FIRST_BYTES: 4d5a MD5: {md5} SHA1: {sha1} SHA256: {sha256} CREATED: Wed Jan  1 00:00:00 2026 MODIFIED: Wed Jan  1 00:00:00 2026 ACCESSED: Wed Jan  1 00:00:00 2026 REASON_1: Yara Rule MATCH: {rule_key} SUBSCORE: 70 DESCRIPTION: test hit REF: https://example.invalid AUTHOR: tester MATCHES:
   $a: 'test'
 20260105T00:00:02Z,{host},NOTICE,Results,Results: 1 alerts, 0 warnings, 0 notices
 20260105T00:00:03Z,{host},NOTICE,Results,Finished LOKI Scan
 """
     log_path.write_text(payload, encoding="utf-8")
     return log_path
+
+
+
+def _write_vt_config(
+    project_root: Path,
+    *,
+    profile: str = "public_safe",
+    daily_request_limit: int = 1000,
+    eligible_severities: list[str] | None = None,
+    eligible_dispositions: list[str] | None = None,
+    batch_size: int = 4,
+    sleep_seconds: int = 0,
+) -> None:
+    config_path = project_root / "config" / "vt_config.yaml"
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["profile"] = profile
+    payload["daily_request_limit"] = daily_request_limit
+    if eligible_severities is not None:
+        payload["eligible_severities"] = eligible_severities
+    if eligible_dispositions is not None:
+        payload["eligible_dispositions"] = eligible_dispositions
+    profiles = payload.setdefault("profiles", {})
+    active_profile = dict(profiles.get(profile, {}))
+    active_profile["batch_size"] = batch_size
+    active_profile["sleep_seconds"] = sleep_seconds
+    profiles[profile] = active_profile
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
+
+def _insert_vt_lookup(
+    conn,
+    *,
+    sha256: str,
+    profile: str,
+    lookup_ts: str,
+    result_status: str = "ok",
+) -> None:
+    upsert_vt_lookup(
+        conn,
+        sha256,
+        profile,
+        result_status,
+        {},
+        {"seeded": True},
+        "seeded lookup" if result_status == "error" else None,
+    )
+    conn.execute(
+        "UPDATE vt_lookups SET lookup_ts = ? WHERE sha256 = ? AND lookup_profile = ?",
+        (lookup_ts, sha256, profile),
+    )
 
 
 
@@ -326,6 +380,274 @@ def test_enrich_vt_includes_notice_but_skips_info(project_root: Path, monkeypatc
 
     assert result["status_counts"] == {"ok": 1, "not_found": 0, "error": 0}
     assert [dict(row) for row in rows] == [{"sha256": "f" * 64, "result_status": "ok"}]
+
+
+
+def test_enrich_vt_stops_when_utc_daily_budget_exhausted(project_root: Path, monkeypatch) -> None:
+    _write_vt_config(project_root, daily_request_limit=1, batch_size=1, sleep_seconds=0)
+    log_path = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ALPHA_2026-01-11_00-00-00.log",
+        host="ALPHA",
+        artifact_path=r"C:\Temp\budget.exe",
+        sha256="1" * 64,
+        rule_key="SuspiciousBinary",
+    )
+    run = ingest_logs([log_path], period="2026-01", run_kind="baseline", project_root=project_root)
+
+    conn = connect(project_root / "state" / "triage.db")
+    ensure_schema(conn)
+    try:
+        _insert_vt_lookup(
+            conn,
+            sha256="f" * 64,
+            profile="public_safe",
+            lookup_ts=datetime.now(UTC).strftime("%Y-%m-%dT12:00:00Z"),
+            result_status="not_found",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    def fake_run(command, capture_output, text, check):
+        raise AssertionError("VT should not be invoked when the UTC daily budget is exhausted")
+
+    monkeypatch.setattr("loki_triage.vt.subprocess.run", fake_run)
+
+    result = enrich_hashes(run["run_id"], project_root=project_root)
+
+    assert result["processed"] == 0
+    assert result["candidate_count"] == 1
+    assert result["selected_count"] == 0
+    assert result["deferred_count"] == 1
+    assert result["used_today"] == 1
+    assert result["remaining_budget"] == 0
+    assert "budget exhausted" in result["summary"]
+
+
+
+def test_enrich_vt_budget_is_scoped_to_active_profile(project_root: Path, monkeypatch) -> None:
+    _write_vt_config(project_root, daily_request_limit=1, batch_size=1, sleep_seconds=0)
+    log_path = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ALPHA_2026-01-12_00-00-00.log",
+        host="ALPHA",
+        artifact_path=r"C:\Temp\profile-scope.exe",
+        sha256="2" * 64,
+        rule_key="SuspiciousBinary",
+    )
+    run = ingest_logs([log_path], period="2026-01", run_kind="baseline", project_root=project_root)
+
+    conn = connect(project_root / "state" / "triage.db")
+    ensure_schema(conn)
+    try:
+        _insert_vt_lookup(
+            conn,
+            sha256="e" * 64,
+            profile="private_fast",
+            lookup_ts=datetime.now(UTC).strftime("%Y-%m-%dT12:30:00Z"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    def fake_run(command, capture_output, text, check):
+        assert ("2" * 64) in command
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps([{"_id": "2" * 64, "last_analysis_stats": {"malicious": 1, "suspicious": 0}}]),
+            stderr="",
+        )
+
+    monkeypatch.setattr("loki_triage.vt.subprocess.run", fake_run)
+
+    result = enrich_hashes(run["run_id"], project_root=project_root)
+
+    assert result["processed"] == 1
+    assert result["used_today"] == 0
+    assert result["selected_count"] == 1
+    assert result["remaining_budget"] == 0
+
+
+
+def test_enrich_vt_utc_day_window_ignores_yesterday_rows(project_root: Path, monkeypatch) -> None:
+    _write_vt_config(project_root, daily_request_limit=1, batch_size=1, sleep_seconds=0)
+    log_path = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ALPHA_2026-01-13_00-00-00.log",
+        host="ALPHA",
+        artifact_path=r"C:\Temp\utc-window.exe",
+        sha256="3" * 64,
+        rule_key="SuspiciousBinary",
+    )
+    run = ingest_logs([log_path], period="2026-01", run_kind="baseline", project_root=project_root)
+
+    conn = connect(project_root / "state" / "triage.db")
+    ensure_schema(conn)
+    try:
+        _insert_vt_lookup(
+            conn,
+            sha256="d" * 64,
+            profile="public_safe",
+            lookup_ts=(datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT23:59:59Z"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    def fake_run(command, capture_output, text, check):
+        assert ("3" * 64) in command
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps([{"_id": "3" * 64, "last_analysis_stats": {"malicious": 1, "suspicious": 0}}]),
+            stderr="",
+        )
+
+    monkeypatch.setattr("loki_triage.vt.subprocess.run", fake_run)
+
+    result = enrich_hashes(run["run_id"], project_root=project_root)
+
+    assert result["processed"] == 1
+    assert result["used_today"] == 0
+    assert result["selected_count"] == 1
+
+
+
+def test_enrich_vt_skips_reviewed_benign_dispositions_by_default(project_root: Path, monkeypatch) -> None:
+    _write_vt_config(project_root, daily_request_limit=5, batch_size=5, sleep_seconds=0)
+    approved_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ALPHA_2026-01-14_00-00-00.log",
+        host="ALPHA",
+        artifact_path=r"C:\Windows\System32\RemComSvc.exe",
+        sha256="4" * 64,
+        rule_key="RemCom_RemoteCommandExecution",
+    )
+    reviewed_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_BETA_2026-01-14_00-00-00.log",
+        host="BETA",
+        artifact_path=r"C:\Temp\reviewed.exe",
+        sha256="5" * 64,
+        rule_key="SuspiciousBinary",
+    )
+    active_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_GAMMA_2026-01-14_00-00-00.log",
+        host="GAMMA",
+        artifact_path=r"C:\Temp\active.exe",
+        sha256="6" * 64,
+        rule_key="SuspiciousBinary",
+    )
+    run = ingest_logs([approved_log, reviewed_log, active_log], period="2026-01", run_kind="baseline", project_root=project_root)
+
+    reviewed_case = next(row for row in queue(project_root=project_root) if row["title"] == r"C:\Temp\reviewed.exe")
+    set_case_verdict(
+        reviewed_case["case_id"],
+        disposition="false_positive",
+        reason="Known benign installer",
+        analyst="pytest",
+        run_id=run["run_id"],
+        project_root=project_root,
+    )
+
+    def fake_run(command, capture_output, text, check):
+        assert ("6" * 64) in command
+        assert ("4" * 64) not in command
+        assert ("5" * 64) not in command
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps([{"_id": "6" * 64, "last_analysis_stats": {"malicious": 1, "suspicious": 0}}]),
+            stderr="",
+        )
+
+    monkeypatch.setattr("loki_triage.vt.subprocess.run", fake_run)
+
+    result = enrich_hashes(run["run_id"], project_root=project_root)
+
+    assert result["candidate_count"] == 1
+    assert result["selected_count"] == 1
+    assert result["processed"] == 1
+
+
+
+def test_enrich_vt_prioritizes_alert_over_warning_under_quota(project_root: Path, monkeypatch) -> None:
+    _write_vt_config(project_root, daily_request_limit=1, batch_size=1, sleep_seconds=0, eligible_dispositions=["unreviewed"])
+    warning_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ALPHA_2026-01-15_00-00-00.log",
+        host="ALPHA",
+        artifact_path=r"C:\Temp\warning.exe",
+        sha256="0" * 64,
+        rule_key="SuspiciousBinary",
+        severity="WARNING",
+        score=400,
+    )
+    alert_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_BETA_2026-01-15_00-00-00.log",
+        host="BETA",
+        artifact_path=r"C:\Temp\alert.exe",
+        sha256="f" * 64,
+        rule_key="SuspiciousBinary",
+        severity="ALERT",
+        score=200,
+    )
+    run = ingest_logs([warning_log, alert_log], period="2026-01", run_kind="baseline", project_root=project_root)
+
+    def fake_run(command, capture_output, text, check):
+        assert ("f" * 64) in command
+        assert ("0" * 64) not in command
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps([{"_id": "f" * 64, "last_analysis_stats": {"malicious": 1, "suspicious": 0}}]),
+            stderr="",
+        )
+
+    monkeypatch.setattr("loki_triage.vt.subprocess.run", fake_run)
+
+    result = enrich_hashes(run["run_id"], project_root=project_root)
+
+    assert result["selected_count"] == 1
+    assert result["processed"] == 1
+
+
+
+def test_enrich_vt_prefers_higher_score_within_same_severity_under_quota(project_root: Path, monkeypatch) -> None:
+    _write_vt_config(project_root, daily_request_limit=1, batch_size=1, sleep_seconds=0, eligible_dispositions=["unreviewed"])
+    lower_score_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ALPHA_2026-01-16_00-00-00.log",
+        host="ALPHA",
+        artifact_path=r"C:\Temp\lower-score.exe",
+        sha256="0" * 64,
+        rule_key="SuspiciousBinary",
+        severity="ALERT",
+        score=100,
+    )
+    higher_score_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_BETA_2026-01-16_00-00-00.log",
+        host="BETA",
+        artifact_path=r"C:\Temp\higher-score.exe",
+        sha256="f" * 64,
+        rule_key="SuspiciousBinary",
+        severity="ALERT",
+        score=900,
+    )
+    run = ingest_logs([lower_score_log, higher_score_log], period="2026-01", run_kind="baseline", project_root=project_root)
+
+    def fake_run(command, capture_output, text, check):
+        assert ("f" * 64) in command
+        assert ("0" * 64) not in command
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps([{"_id": "f" * 64, "last_analysis_stats": {"malicious": 1, "suspicious": 0}}]),
+            stderr="",
+        )
+
+    monkeypatch.setattr("loki_triage.vt.subprocess.run", fake_run)
+
+    result = enrich_hashes(run["run_id"], project_root=project_root)
+
+    assert result["selected_count"] == 1
+    assert result["processed"] == 1
+
 
 
 def test_vt_signal_marks_case_needs_followup(project_root: Path, copy_fixture_log) -> None:
