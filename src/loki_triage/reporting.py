@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from collections import defaultdict
@@ -20,7 +21,7 @@ DEFAULT_APPENDIX_HOST_LIMIT = 25
 DEFAULT_APPENDIX_FINDINGS_PER_HOST = 10
 PDF_RENDER_TIMEOUT_SECONDS = 900
 PRIORITY_ORDER_SQL = """
-CASE f.priority
+CASE c.priority
     WHEN 'critical' THEN 5
     WHEN 'high' THEN 4
     WHEN 'medium' THEN 3
@@ -29,7 +30,7 @@ CASE f.priority
 END
 """
 SEVERITY_ORDER_SQL = """
-CASE f.severity
+CASE c.severity
     WHEN 'ALERT' THEN 5
     WHEN 'WARNING' THEN 4
     WHEN 'ERROR' THEN 3
@@ -50,6 +51,87 @@ def _scope_run_ids(conn, period: str, run_id: str | None) -> list[str]:
 
 
 
+def _scope_placeholders(run_ids: list[str]) -> str:
+    return ",".join("?" for _ in run_ids)
+
+
+
+def _legacy_scope_has_findings(conn, run_ids: list[str]) -> bool:
+    placeholders = _scope_placeholders(run_ids)
+    row = conn.execute(
+        f"""
+        WITH finding_runs AS (
+            SELECT DISTINCT run_id FROM finding_occurrences WHERE run_id IN ({placeholders})
+        ),
+        case_runs AS (
+            SELECT DISTINCT run_id FROM case_occurrences WHERE run_id IN ({placeholders})
+        )
+        SELECT COUNT(*) AS count
+        FROM finding_runs fr
+        LEFT JOIN case_runs cr ON cr.run_id = fr.run_id
+        WHERE cr.run_id IS NULL
+        """,
+        [*run_ids, *run_ids],
+    ).fetchone()
+    return int(row["count"] or 0) > 0
+
+
+
+def _load_vt_summary(row: dict[str, Any]) -> dict[str, Any] | None:
+    if row.get("vt_result_status") != "ok":
+        return None
+    raw = row.get("vt_summary_json")
+    if not raw:
+        return None
+    return json.loads(str(raw))
+
+
+
+def _with_rule_lists(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for row in rows:
+        matched_rules = str(row.get("matched_rules") or "")
+        row["matched_rules_list"] = [item for item in matched_rules.split(",") if item]
+        row["vt_summary"] = _load_vt_summary(row)
+        row.pop("vt_summary_json", None)
+    return rows
+
+
+
+def _vt_coverage(conn, run_ids: list[str], lookup_profile: str) -> dict[str, int]:
+    placeholders = _scope_placeholders(run_ids)
+    row = conn.execute(
+        f"""
+        WITH scoped_cases AS (
+            SELECT DISTINCT c.id, c.sha256
+            FROM cases c
+            JOIN case_occurrences co ON co.case_id = c.id
+            WHERE co.run_id IN ({placeholders})
+        )
+        SELECT
+            SUM(CASE WHEN sc.sha256 IS NOT NULL THEN 1 ELSE 0 END) AS hash_case_count,
+            SUM(CASE WHEN sc.sha256 IS NOT NULL AND vt.result_status = 'ok' THEN 1 ELSE 0 END) AS vt_covered_case_count,
+            SUM(CASE WHEN sc.sha256 IS NOT NULL AND vt.result_status = 'not_found' THEN 1 ELSE 0 END) AS vt_not_found_case_count,
+            SUM(CASE WHEN sc.sha256 IS NOT NULL AND vt.result_status = 'error' THEN 1 ELSE 0 END) AS vt_error_case_count
+        FROM scoped_cases sc
+        LEFT JOIN vt_lookups vt ON vt.sha256 = sc.sha256 AND vt.lookup_profile = ?
+        """,
+        [*run_ids, lookup_profile],
+    ).fetchone()
+    hash_case_count = int(row["hash_case_count"] or 0)
+    vt_covered_case_count = int(row["vt_covered_case_count"] or 0)
+    vt_not_found_case_count = int(row["vt_not_found_case_count"] or 0)
+    vt_error_case_count = int(row["vt_error_case_count"] or 0)
+    vt_missing_case_count = max(hash_case_count - vt_covered_case_count - vt_not_found_case_count - vt_error_case_count, 0)
+    return {
+        "hash_case_count": hash_case_count,
+        "vt_covered_case_count": vt_covered_case_count,
+        "vt_not_found_case_count": vt_not_found_case_count,
+        "vt_error_case_count": vt_error_case_count,
+        "vt_missing_case_count": vt_missing_case_count,
+    }
+
+
+
 def _query_report_dataset(
     conn,
     run_ids: list[str],
@@ -60,156 +142,266 @@ def _query_report_dataset(
         return {
             "kpis": {},
             "top_hosts": [],
-            "findings": [],
+            "cases": [],
+            "priority_cases": [],
             "appendix": {},
-            "recurrent_false_positives": [],
+            "recurrent_benign_rules": [],
+            "vt_coverage": {},
         }
-    placeholders = ",".join("?" for _ in run_ids)
-    scope_clause = f"WHERE fo.run_id IN ({placeholders})"
+    placeholders = _scope_placeholders(run_ids)
+
     host_rows = conn.execute(
         f"""
-        SELECT fo.host, COUNT(*) AS occurrence_count
-        FROM finding_occurrences fo
-        {scope_clause}
-        GROUP BY fo.host
-        ORDER BY occurrence_count DESC, fo.host ASC
+        SELECT host, COUNT(*) AS occurrence_count
+        FROM case_occurrences
+        WHERE run_id IN ({placeholders})
+        GROUP BY host
+        ORDER BY occurrence_count DESC, host ASC
         """,
         run_ids,
     ).fetchall()
-    finding_rows = conn.execute(
+
+    case_rows = conn.execute(
         f"""
+        WITH scoped_occurrences AS (
+            SELECT * FROM case_occurrences WHERE run_id IN ({placeholders})
+        ),
+        case_metrics AS (
+            SELECT
+                case_id,
+                COUNT(*) AS occurrence_count,
+                COUNT(DISTINCT host) AS host_count,
+                MIN(occurrence_ts) AS first_occurrence_ts,
+                MAX(occurrence_ts) AS last_occurrence_ts
+            FROM scoped_occurrences
+            GROUP BY case_id
+        ),
+        latest_case AS (
+            SELECT
+                sco.case_id,
+                sco.host,
+                sco.state_for_host_run,
+                sco.event_type,
+                sco.event_kind,
+                sco.artifact_path,
+                sco.source_path,
+                sco.source_line_start,
+                sco.source_line_end
+            FROM scoped_occurrences sco
+            JOIN (
+                SELECT case_id, MAX(occurrence_ts) AS last_occurrence_ts
+                FROM scoped_occurrences
+                GROUP BY case_id
+            ) latest
+              ON latest.case_id = sco.case_id
+             AND latest.last_occurrence_ts = sco.occurrence_ts
+            GROUP BY sco.case_id
+        ),
+        case_rules AS (
+            SELECT
+                cm.case_id,
+                GROUP_CONCAT(DISTINCT f.rule_key) AS matched_rules,
+                COUNT(DISTINCT f.id) AS detection_count
+            FROM case_memberships cm
+            JOIN findings f ON f.id = cm.finding_id
+            GROUP BY cm.case_id
+        )
         SELECT
-            f.id AS finding_id,
-            f.title,
-            f.current_disposition,
-            f.priority,
-            f.severity,
-            f.current_reason,
-            fo.host,
-            fo.occurrence_ts,
-            fo.state_for_host_run,
-            fo.event_type,
-            fo.event_kind,
-            fo.artifact_path,
-            fo.sha256,
-            fo.rule_key,
-            fo.score,
-            fo.source_path,
-            fo.source_line_start,
-            fo.source_line_end,
-            vt.summary_json AS vt_summary_json
-        FROM finding_occurrences fo
-        JOIN findings f ON f.id = fo.finding_id
-        LEFT JOIN vt_lookups vt ON vt.sha256 = fo.sha256 AND vt.lookup_profile = ?
-        {scope_clause}
-        ORDER BY {PRIORITY_ORDER_SQL} DESC, {SEVERITY_ORDER_SQL} DESC, fo.occurrence_ts DESC, fo.host ASC
+            c.id AS case_id,
+            c.title,
+            c.current_disposition,
+            c.priority,
+            c.severity,
+            c.current_reason,
+            c.sha256,
+            COALESCE(latest_case.artifact_path, c.artifact_path) AS artifact_path,
+            case_metrics.occurrence_count,
+            case_metrics.host_count,
+            case_metrics.first_occurrence_ts,
+            case_metrics.last_occurrence_ts,
+            latest_case.host AS latest_host,
+            latest_case.state_for_host_run,
+            latest_case.event_type,
+            latest_case.event_kind,
+            latest_case.source_path,
+            latest_case.source_line_start,
+            latest_case.source_line_end,
+            case_rules.matched_rules,
+            case_rules.detection_count,
+            vt.result_status AS vt_result_status,
+            vt.summary_json AS vt_summary_json,
+            vt.error_text AS vt_error_text,
+            vt.lookup_ts AS vt_lookup_ts
+        FROM case_metrics
+        JOIN cases c ON c.id = case_metrics.case_id
+        LEFT JOIN latest_case ON latest_case.case_id = c.id
+        LEFT JOIN case_rules ON case_rules.case_id = c.id
+        LEFT JOIN vt_lookups vt ON vt.sha256 = c.sha256 AND vt.lookup_profile = ?
+        ORDER BY {PRIORITY_ORDER_SQL} DESC, {SEVERITY_ORDER_SQL} DESC, case_metrics.last_occurrence_ts DESC, c.id ASC
         """,
-        [lookup_profile, *run_ids],
+        [*run_ids, lookup_profile],
     ).fetchall()
+
     appendix_rows = conn.execute(
         f"""
+        WITH scoped_occurrences AS (
+            SELECT * FROM case_occurrences WHERE run_id IN ({placeholders})
+        ),
+        host_case_metrics AS (
+            SELECT
+                host,
+                case_id,
+                COUNT(*) AS occurrence_count,
+                MIN(occurrence_ts) AS first_occurrence_ts,
+                MAX(occurrence_ts) AS last_occurrence_ts
+            FROM scoped_occurrences
+            GROUP BY host, case_id
+        ),
+        host_case_latest AS (
+            SELECT
+                sco.host,
+                sco.case_id,
+                sco.state_for_host_run,
+                sco.event_type,
+                sco.event_kind,
+                sco.artifact_path,
+                sco.source_path,
+                sco.source_line_start,
+                sco.source_line_end
+            FROM scoped_occurrences sco
+            JOIN (
+                SELECT host, case_id, MAX(occurrence_ts) AS last_occurrence_ts
+                FROM scoped_occurrences
+                GROUP BY host, case_id
+            ) latest
+              ON latest.host = sco.host
+             AND latest.case_id = sco.case_id
+             AND latest.last_occurrence_ts = sco.occurrence_ts
+            GROUP BY sco.host, sco.case_id
+        ),
+        case_rules AS (
+            SELECT cm.case_id, GROUP_CONCAT(DISTINCT f.rule_key) AS matched_rules
+            FROM case_memberships cm
+            JOIN findings f ON f.id = cm.finding_id
+            GROUP BY cm.case_id
+        )
         SELECT
-            f.id AS finding_id,
-            f.title,
-            f.current_disposition,
-            f.priority,
-            f.severity,
-            f.current_reason,
-            fo.host,
-            MIN(fo.occurrence_ts) AS first_occurrence_ts,
-            MAX(fo.occurrence_ts) AS last_occurrence_ts,
-            MAX(fo.state_for_host_run) AS state_for_host_run,
-            MAX(fo.event_type) AS event_type,
-            MAX(fo.event_kind) AS event_kind,
-            MAX(fo.artifact_path) AS artifact_path,
-            MAX(fo.sha256) AS sha256,
-            fo.rule_key,
-            MAX(fo.score) AS score,
-            MIN(fo.source_path) AS source_path,
-            MIN(fo.source_line_start) AS source_line_start,
-            MIN(fo.source_line_end) AS source_line_end,
-            COUNT(*) AS occurrence_count,
-            vt.summary_json AS vt_summary_json
-        FROM finding_occurrences fo
-        JOIN findings f ON f.id = fo.finding_id
-        LEFT JOIN vt_lookups vt ON vt.sha256 = fo.sha256 AND vt.lookup_profile = ?
-        {scope_clause}
-        GROUP BY fo.host, f.id, fo.rule_key, vt.summary_json
-        ORDER BY fo.host ASC, {PRIORITY_ORDER_SQL} DESC, {SEVERITY_ORDER_SQL} DESC, last_occurrence_ts DESC
+            host_case_metrics.host,
+            c.id AS case_id,
+            c.title,
+            c.current_disposition,
+            c.priority,
+            c.severity,
+            c.current_reason,
+            c.sha256,
+            COALESCE(host_case_latest.artifact_path, c.artifact_path) AS artifact_path,
+            host_case_metrics.occurrence_count,
+            host_case_metrics.first_occurrence_ts,
+            host_case_metrics.last_occurrence_ts,
+            host_case_latest.state_for_host_run,
+            host_case_latest.event_type,
+            host_case_latest.event_kind,
+            host_case_latest.source_path,
+            host_case_latest.source_line_start,
+            host_case_latest.source_line_end,
+            case_rules.matched_rules,
+            vt.result_status AS vt_result_status,
+            vt.summary_json AS vt_summary_json,
+            vt.error_text AS vt_error_text,
+            vt.lookup_ts AS vt_lookup_ts
+        FROM host_case_metrics
+        JOIN cases c ON c.id = host_case_metrics.case_id
+        LEFT JOIN host_case_latest ON host_case_latest.case_id = c.id AND host_case_latest.host = host_case_metrics.host
+        LEFT JOIN case_rules ON case_rules.case_id = c.id
+        LEFT JOIN vt_lookups vt ON vt.sha256 = c.sha256 AND vt.lookup_profile = ?
+        ORDER BY host_case_metrics.host ASC, {PRIORITY_ORDER_SQL} DESC, {SEVERITY_ORDER_SQL} DESC, host_case_metrics.last_occurrence_ts DESC, c.id ASC
         """,
-        [lookup_profile, *run_ids],
+        [*run_ids, lookup_profile],
     ).fetchall()
-    kpis = conn.execute(
+
+    kpis_row = conn.execute(
         f"""
+        WITH scoped_case_ids AS (
+            SELECT DISTINCT case_id FROM case_occurrences WHERE run_id IN ({placeholders})
+        )
         SELECT
-            COUNT(DISTINCT fo.host) AS host_count,
-            COUNT(DISTINCT fo.finding_id) AS finding_count,
-            SUM(CASE WHEN fo.state_for_host_run = 'new' THEN 1 ELSE 0 END) AS new_count,
-            SUM(CASE WHEN fo.state_for_host_run = 'persisting' THEN 1 ELSE 0 END) AS persisting_count,
-            SUM(CASE WHEN fo.state_for_host_run = 'reopened' THEN 1 ELSE 0 END) AS reopened_count,
-            SUM(CASE WHEN f.current_disposition = 'true_positive' THEN 1 ELSE 0 END) AS true_positive_count,
-            SUM(CASE WHEN f.current_disposition = 'false_positive' THEN 1 ELSE 0 END) AS false_positive_count,
-            SUM(CASE WHEN f.current_disposition = 'needs_followup' THEN 1 ELSE 0 END) AS needs_followup_count,
-            SUM(CASE WHEN f.current_disposition = 'unreviewed' THEN 1 ELSE 0 END) AS unreviewed_count
-        FROM finding_occurrences fo
-        JOIN findings f ON f.id = fo.finding_id
-        {scope_clause}
+            (SELECT COUNT(DISTINCT host) FROM case_occurrences WHERE run_id IN ({placeholders})) AS host_count,
+            (SELECT COUNT(*) FROM case_occurrences WHERE run_id IN ({placeholders})) AS occurrence_count,
+            (SELECT COUNT(*) FROM finding_occurrences WHERE run_id IN ({placeholders})) AS detection_match_count,
+            (SELECT COUNT(*) FROM scoped_case_ids) AS artifact_case_count,
+            (SELECT COUNT(*) FROM scoped_case_ids sc JOIN cases c ON c.id = sc.case_id WHERE c.current_disposition <> 'unreviewed') AS reviewed_case_count,
+            (SELECT COUNT(*) FROM scoped_case_ids sc JOIN cases c ON c.id = sc.case_id WHERE c.current_disposition = 'true_positive') AS true_positive_count,
+            (SELECT COUNT(*) FROM scoped_case_ids sc JOIN cases c ON c.id = sc.case_id WHERE c.current_disposition = 'false_positive') AS false_positive_count,
+            (SELECT COUNT(*) FROM scoped_case_ids sc JOIN cases c ON c.id = sc.case_id WHERE c.current_disposition = 'expected_benign') AS expected_benign_count,
+            (SELECT COUNT(*) FROM scoped_case_ids sc JOIN cases c ON c.id = sc.case_id WHERE c.current_disposition = 'needs_followup') AS needs_followup_count,
+            (SELECT COUNT(*) FROM scoped_case_ids sc JOIN cases c ON c.id = sc.case_id WHERE c.current_disposition = 'unreviewed') AS unreviewed_count,
+            (SELECT COUNT(*) FROM case_occurrences WHERE run_id IN ({placeholders}) AND state_for_host_run = 'new') AS new_count,
+            (SELECT COUNT(*) FROM case_occurrences WHERE run_id IN ({placeholders}) AND state_for_host_run = 'persisting') AS persisting_count,
+            (SELECT COUNT(*) FROM case_occurrences WHERE run_id IN ({placeholders}) AND state_for_host_run = 'reopened') AS reopened_count
         """,
-        run_ids,
+        [*run_ids, *run_ids, *run_ids, *run_ids, *run_ids, *run_ids, *run_ids],
     ).fetchone()
-    recurrent_false_positive_rows = conn.execute(
+
+    recurrent_benign_rows = conn.execute(
         f"""
-        SELECT fo.rule_key, COUNT(*) AS occurrences
-        FROM finding_occurrences fo
-        JOIN findings f ON f.id = fo.finding_id
-        {scope_clause} AND f.current_disposition = 'false_positive'
-        GROUP BY fo.rule_key
-        ORDER BY occurrences DESC, fo.rule_key ASC
+        WITH scoped_case_ids AS (
+            SELECT DISTINCT case_id FROM case_occurrences WHERE run_id IN ({placeholders})
+        ),
+        case_metrics AS (
+            SELECT case_id, COUNT(*) AS occurrence_count
+            FROM case_occurrences
+            WHERE run_id IN ({placeholders})
+            GROUP BY case_id
+        )
+        SELECT
+            c.current_disposition,
+            f.rule_key,
+            COUNT(DISTINCT c.id) AS case_count,
+            SUM(case_metrics.occurrence_count) AS occurrence_count
+        FROM scoped_case_ids sc
+        JOIN cases c ON c.id = sc.case_id
+        JOIN case_metrics ON case_metrics.case_id = c.id
+        JOIN case_memberships cm ON cm.case_id = c.id
+        JOIN findings f ON f.id = cm.finding_id
+        WHERE c.current_disposition IN ('expected_benign', 'false_positive')
+        GROUP BY c.current_disposition, f.rule_key
+        ORDER BY occurrence_count DESC, case_count DESC, f.rule_key ASC
         LIMIT 10
         """,
-        run_ids,
+        [*run_ids, *run_ids],
     ).fetchall()
+
+    vt_coverage = _vt_coverage(conn, run_ids, lookup_profile)
+
     top_findings_limit = int(report_config.get("top_findings_limit", DEFAULT_TOP_FINDINGS_LIMIT))
     appendix_host_limit = int(report_config.get("appendix_host_limit", DEFAULT_APPENDIX_HOST_LIMIT))
     appendix_findings_per_host = int(
         report_config.get("appendix_findings_per_host", DEFAULT_APPENDIX_FINDINGS_PER_HOST)
     )
+
     appendix_allowed_hosts = [
         str(row["host"]) for row in host_rows[:appendix_host_limit] if row["host"] is not None
     ]
     appendix: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    rendered_findings: list[dict[str, Any]] = []
-    for row in finding_rows:
-        item = dict(row)
-        if item.get("vt_summary_json"):
-            import json
-
-            item["vt_summary"] = json.loads(item["vt_summary_json"])
-        else:
-            item["vt_summary"] = None
-        item.pop("vt_summary_json", None)
-        rendered_findings.append(item)
-    for row in appendix_rows:
-        item = dict(row)
-        host = item.get("host") or "unknown-host"
+    rendered_cases = _with_rule_lists([dict(row) for row in case_rows])
+    for row in _with_rule_lists([dict(row) for row in appendix_rows]):
+        host = row.get("host") or "unknown-host"
         if appendix_allowed_hosts and host not in appendix_allowed_hosts:
             continue
         if len(appendix[host]) >= appendix_findings_per_host:
             continue
-        if item.get("vt_summary_json"):
-            import json
+        appendix[host].append(row)
 
-            item["vt_summary"] = json.loads(item["vt_summary_json"])
-        else:
-            item["vt_summary"] = None
-        item.pop("vt_summary_json", None)
-        appendix[host].append(item)
+    suppressed = {"expected_benign", "false_positive"}
+    priority_cases = [row for row in rendered_cases if row.get("current_disposition") not in suppressed]
+
     return {
-        "kpis": dict(kpis) if kpis else {},
+        "kpis": {**(dict(kpis_row) if kpis_row else {}), **vt_coverage},
         "top_hosts": [dict(row) for row in host_rows[:TOP_HOSTS_LIMIT]],
-        "findings": rendered_findings,
+        "cases": rendered_cases,
+        "priority_cases": priority_cases[:top_findings_limit],
         "appendix": dict(appendix),
-        "recurrent_false_positives": [dict(row) for row in recurrent_false_positive_rows],
+        "recurrent_benign_rules": [dict(row) for row in recurrent_benign_rows],
         "report_limits": {
             "top_findings_limit": top_findings_limit,
             "appendix_host_limit": appendix_host_limit,
@@ -217,6 +409,7 @@ def _query_report_dataset(
             "appendix_host_count_rendered": len(appendix),
             "appendix_host_count_total": len(host_rows),
         },
+        "vt_coverage": vt_coverage,
     }
 
 
@@ -261,7 +454,12 @@ def _render_pdf(html_path: Path, pdf_path: Path) -> None:
 
 
 
-def build_report(period: str, run_id: str | None = None, project_root: Path | None = None) -> dict[str, Any]:
+def build_report(
+    period: str,
+    run_id: str | None = None,
+    project_root: Path | None = None,
+    allow_missing_vt: bool = False,
+) -> dict[str, Any]:
     paths = get_project_paths(project_root)
     runtime_config = load_runtime_config(paths)
     conn = connect(paths.db_path)
@@ -270,8 +468,17 @@ def build_report(period: str, run_id: str | None = None, project_root: Path | No
         run_ids = _scope_run_ids(conn, period, run_id)
         if not run_ids:
             raise KeyError(f"No scan runs found for period {period!r}{f' and run {run_id!r}' if run_id else ''}")
+        if _legacy_scope_has_findings(conn, run_ids):
+            raise RuntimeError(
+                "Report scope contains legacy finding rows without case data. Rebuild derived state by re-ingesting raw logs into a fresh state/triage.db."
+            )
         lookup_profile = str(runtime_config.vt_config.get("profile", "public_safe"))
         dataset = _query_report_dataset(conn, run_ids, lookup_profile, runtime_config.report_config)
+        coverage = dataset["vt_coverage"]
+        if coverage.get("hash_case_count", 0) > 0 and coverage.get("vt_covered_case_count", 0) == 0 and not allow_missing_vt:
+            raise RuntimeError(
+                "Scoped hash-bearing cases have zero VT coverage. Run `loki-triage enrich-vt` first or rebuild with --allow-missing-vt."
+            )
         report_id = f"report-{period}-{compact_utc_now()}"
         report_dir = paths.runs_dir / period / (run_id or "period-summary") / "report"
         report_dir.mkdir(parents=True, exist_ok=True)
@@ -292,22 +499,20 @@ def build_report(period: str, run_id: str | None = None, project_root: Path | No
         _render_pdf(html_path, pdf_path)
         write_csv(
             csv_path,
-            dataset["findings"],
+            dataset["cases"],
             [
-                "finding_id",
+                "case_id",
                 "title",
                 "current_disposition",
                 "priority",
                 "severity",
-                "host",
-                "occurrence_ts",
-                "state_for_host_run",
-                "event_type",
-                "event_kind",
                 "artifact_path",
                 "sha256",
-                "rule_key",
-                "score",
+                "occurrence_count",
+                "host_count",
+                "first_occurrence_ts",
+                "last_occurrence_ts",
+                "matched_rules",
                 "source_path",
                 "source_line_start",
                 "source_line_end",

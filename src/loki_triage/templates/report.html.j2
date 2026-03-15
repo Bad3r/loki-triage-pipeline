@@ -1,464 +1,454 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>{{ config.get('report_title', 'Loki Triage Report') }} - {{ period }}</title>
-  <style>
-    :root {
-      --primary: {{ config.get('primary_color', '#0b3954') }};
-      --secondary: {{ config.get('secondary_color', '#087e8b') }};
-      --accent: {{ config.get('accent_color', '#bfd7ea') }};
-      --ink: #10212b;
-      --muted: #58707f;
-      --line: #d7e1e7;
-      --paper: #f7fafc;
-      --white: #ffffff;
-    }
-    @page {
-      size: A4;
-      margin: 14mm;
-    }
-    * {
-      box-sizing: border-box;
-    }
-    body {
-      margin: 0;
-      color: var(--ink);
-      background: var(--paper);
-      font-family: "Source Serif 4", Georgia, serif;
-      font-size: 12px;
-      line-height: 1.45;
-    }
-    h1, h2, h3, h4 {
-      margin: 0;
-      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      line-height: 1.15;
-    }
-    .page {
-      display: block;
-    }
-    .hero {
-      position: relative;
-      overflow: hidden;
-      padding: 22px 24px 20px;
-      background: linear-gradient(135deg, var(--primary), #114b5f 58%, var(--secondary));
-      color: var(--white);
-      border-radius: 14px;
-    }
-    .hero::after {
-      content: "";
-      position: absolute;
-      inset: auto -70px -70px auto;
-      width: 180px;
-      height: 180px;
-      background: radial-gradient(circle, rgba(255,255,255,0.28), rgba(255,255,255,0));
-      border-radius: 50%;
-    }
-    .hero-top {
-      display: flex;
-      justify-content: space-between;
-      gap: 20px;
-      align-items: flex-start;
-    }
-    .hero-meta {
-      min-width: 220px;
-      text-align: right;
-      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      font-size: 11px;
-    }
-    .hero h1 {
-      font-size: 28px;
-      margin-bottom: 6px;
-    }
-    .hero p {
-      margin: 0;
-      max-width: 620px;
-      font-size: 13px;
-      opacity: 0.92;
-    }
-    .hero-logo {
-      max-width: 120px;
-      max-height: 46px;
-      margin-bottom: 10px;
-      object-fit: contain;
-      background: rgba(255,255,255,0.94);
-      padding: 6px 8px;
-      border-radius: 8px;
-    }
-    .section {
-      margin-top: 18px;
-      background: var(--white);
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 16px 18px;
-      break-inside: avoid;
-    }
-    .section-header {
-      display: flex;
-      justify-content: space-between;
-      gap: 14px;
-      margin-bottom: 12px;
-      align-items: baseline;
-    }
-    .section-title {
-      font-size: 16px;
-      color: var(--primary);
-    }
-    .section-subtitle {
-      color: var(--muted);
-      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      font-size: 11px;
-    }
-    .kpi-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-    }
-    .kpi {
-      padding: 14px;
-      border-radius: 10px;
-      background: linear-gradient(180deg, #ffffff, #f2f7fa);
-      border: 1px solid var(--line);
-    }
-    .kpi-label {
-      display: block;
-      margin-bottom: 6px;
-      color: var(--muted);
-      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
-    .kpi-value {
-      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      font-weight: 700;
-      font-size: 28px;
-      color: var(--primary);
-    }
-    .note {
-      margin-top: 10px;
-      padding: 10px 12px;
-      border-left: 4px solid var(--secondary);
-      background: #f3fbfc;
-      color: #20404e;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 11px;
-    }
-    th, td {
-      padding: 8px 9px;
-      border-bottom: 1px solid var(--line);
-      vertical-align: top;
-      text-align: left;
-    }
-    th {
-      color: var(--muted);
-      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-    }
-    .pill {
-      display: inline-block;
-      padding: 3px 8px;
-      border-radius: 999px;
-      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      font-size: 10px;
-      font-weight: 700;
-      white-space: nowrap;
-    }
-    .severity-ALERT, .priority-critical, .disposition-true_positive {
-      background: #ffe3e0;
-      color: #8a1f17;
-    }
-    .severity-WARNING, .priority-high, .disposition-needs_followup {
-      background: #fff1d6;
-      color: #8a5a00;
-    }
-    .severity-ERROR, .priority-medium {
-      background: #f5ebff;
-      color: #5d3683;
-    }
-    .severity-NOTICE, .priority-low, .disposition-false_positive {
-      background: #e6f4ff;
-      color: #0a5381;
-    }
-    .severity-INFO, .priority-info, .disposition-unreviewed, .disposition-expected_benign {
-      background: #edf3f6;
-      color: #48616f;
-    }
-    .appendix-host {
-      margin-top: 16px;
-      padding-top: 12px;
-      border-top: 1px solid var(--line);
-    }
-    .appendix-host:first-of-type {
-      margin-top: 0;
-      padding-top: 0;
-      border-top: 0;
-    }
-    .appendix-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-      margin-top: 10px;
-    }
-    .finding-card {
-      padding: 12px;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: #fcfdfe;
-      break-inside: avoid;
-    }
-    .finding-card h4 {
-      font-size: 13px;
-      margin-bottom: 8px;
-      color: var(--primary);
-    }
-    .meta-row {
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 11px;
-    }
-    .summary-list {
-      margin: 0;
-      padding-left: 18px;
-    }
-    .summary-list li {
-      margin-bottom: 6px;
-    }
-    .mono {
-      font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
-      word-break: break-all;
-    }
-    .footnote {
-      margin-top: 18px;
-      color: var(--muted);
-      font-size: 10px;
-      text-align: right;
-    }
-  </style>
-</head>
-<body>
-  <div class="page">
-    <section class="hero">
-      <div class="hero-top">
+  <head>
+    <meta charset="utf-8">
+    <title>{{ config.get('report_title', 'Loki Threat Triage') }}</title>
+    <style>
+      :root {
+        --primary: {{ config.get('primary_color', '#0b3954') }};
+        --secondary: {{ config.get('secondary_color', '#087e8b') }};
+        --accent: {{ config.get('accent_color', '#bfd7ea') }};
+        --ink: #13293d;
+        --muted: #4d6a7f;
+        --paper: #f7fbfc;
+        --line: #dbe7ec;
+        --danger: #a11d33;
+        --warn: #d9822b;
+        --ok: #2a7f62;
+        --soft: #eef4f7;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        color: var(--ink);
+        background: linear-gradient(180deg, #fbfdfe 0%, #eef5f7 100%);
+      }
+      .page {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 36px;
+      }
+      .hero {
+        background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+        color: white;
+        border-radius: 24px;
+        padding: 30px;
+        display: grid;
+        grid-template-columns: 1.8fr 1fr;
+        gap: 24px;
+        box-shadow: 0 18px 40px rgba(11, 57, 84, 0.18);
+      }
+      .hero h1 {
+        margin: 0 0 8px;
+        font-size: 34px;
+        line-height: 1.1;
+      }
+      .hero p {
+        margin: 0;
+        color: rgba(255, 255, 255, 0.85);
+      }
+      .hero-meta {
+        background: rgba(255, 255, 255, 0.12);
+        border: 1px solid rgba(255, 255, 255, 0.22);
+        border-radius: 18px;
+        padding: 16px;
+        display: grid;
+        gap: 8px;
+        align-self: start;
+      }
+      .section {
+        margin-top: 28px;
+        background: white;
+        border: 1px solid var(--line);
+        border-radius: 22px;
+        padding: 24px;
+        box-shadow: 0 12px 28px rgba(19, 41, 61, 0.06);
+      }
+      .section-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 16px;
+        margin-bottom: 18px;
+      }
+      .section-title {
+        margin: 0;
+        font-size: 24px;
+      }
+      .section-subtitle {
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .kpi-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 16px;
+      }
+      .kpi {
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 16px;
+      }
+      .kpi-label {
+        display: block;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        margin-bottom: 10px;
+      }
+      .kpi-value {
+        font-size: 30px;
+        font-weight: 700;
+        line-height: 1;
+      }
+      .summary-list {
+        margin: 16px 0 0;
+        padding-left: 18px;
+      }
+      .summary-list li {
+        margin: 8px 0;
+      }
+      .note {
+        margin-top: 14px;
+        padding: 14px 16px;
+        background: var(--soft);
+        border-left: 4px solid var(--accent);
+        border-radius: 14px;
+        color: var(--muted);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+      }
+      th, td {
+        text-align: left;
+        padding: 12px 10px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+      th {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        padding: 4px 10px;
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: lowercase;
+        letter-spacing: 0.02em;
+      }
+      .priority-critical, .severity-ALERT, .disposition-true_positive {
+        background: rgba(161, 29, 51, 0.12);
+        color: var(--danger);
+      }
+      .priority-high, .severity-WARNING, .disposition-needs_followup {
+        background: rgba(217, 130, 43, 0.14);
+        color: var(--warn);
+      }
+      .priority-medium, .severity-ERROR {
+        background: rgba(42, 127, 98, 0.12);
+        color: var(--ok);
+      }
+      .priority-low, .severity-NOTICE, .disposition-false_positive, .disposition-expected_benign {
+        background: rgba(8, 126, 139, 0.12);
+        color: var(--secondary);
+      }
+      .priority-info, .severity-INFO, .disposition-unreviewed {
+        background: rgba(19, 41, 61, 0.08);
+        color: var(--ink);
+      }
+      .meta-row {
+        color: var(--muted);
+        font-size: 13px;
+        margin-top: 6px;
+      }
+      .mono {
+        font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+        font-size: 12px;
+        word-break: break-all;
+      }
+      .appendix-host {
+        margin-bottom: 24px;
+      }
+      .appendix-host h3 {
+        margin: 0 0 14px;
+        font-size: 18px;
+      }
+      .appendix-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+      }
+      .finding-card {
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 16px;
+        background: linear-gradient(180deg, white 0%, var(--paper) 100%);
+      }
+      .finding-card h4 {
+        margin: 0 0 10px;
+        font-size: 16px;
+      }
+      @media print {
+        body { background: white; }
+        .page { padding: 18px; }
+        .section, .hero { box-shadow: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <section class="hero">
         <div>
-          <div class="section-subtitle">{{ config.get('organization_name', 'Organization') }}</div>
           <h1>{{ config.get('report_title', 'Loki Threat Triage') }}</h1>
           <p>{{ config.get('subtitle', 'Executive summary and technical appendix') }}</p>
         </div>
         <div class="hero-meta">
-          {% if config.get('logo_path') %}
-          <img class="hero-logo" src="{{ config.get('logo_path') }}" alt="Logo">
-          {% endif %}
           <div><strong>Period:</strong> {{ period }}</div>
           <div><strong>Generated:</strong> {{ generated_at }}</div>
           <div><strong>Runs:</strong> {{ run_ids|length }}</div>
           <div><strong>Report ID:</strong> {{ report_id }}</div>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <section class="section">
-      <div class="section-header">
-        <h2 class="section-title">Executive Summary</h2>
-        <div class="section-subtitle">Management-facing overview</div>
-      </div>
-      <div class="kpi-grid">
-        <div class="kpi">
-          <span class="kpi-label">Hosts Covered</span>
-          <span class="kpi-value">{{ dataset.kpis.get('host_count', 0) }}</span>
+      <section class="section">
+        <div class="section-header">
+          <h2 class="section-title">Executive Summary</h2>
+          <div class="section-subtitle">Case-centric triage metrics</div>
         </div>
-        <div class="kpi">
-          <span class="kpi-label">Unique Findings</span>
-          <span class="kpi-value">{{ dataset.kpis.get('finding_count', 0) }}</span>
-        </div>
-        <div class="kpi">
-          <span class="kpi-label">Needs Follow-up</span>
-          <span class="kpi-value">{{ dataset.kpis.get('needs_followup_count', 0) }}</span>
-        </div>
-        <div class="kpi">
-          <span class="kpi-label">True Positives</span>
-          <span class="kpi-value">{{ dataset.kpis.get('true_positive_count', 0) }}</span>
-        </div>
-        <div class="kpi">
-          <span class="kpi-label">False Positives</span>
-          <span class="kpi-value">{{ dataset.kpis.get('false_positive_count', 0) }}</span>
-        </div>
-        <div class="kpi">
-          <span class="kpi-label">Unreviewed</span>
-          <span class="kpi-value">{{ dataset.kpis.get('unreviewed_count', 0) }}</span>
-        </div>
-      </div>
-      <div class="note">{{ config.get('disclaimer', '') }}</div>
-      <ul class="summary-list">
-        <li>New findings in scope: {{ dataset.kpis.get('new_count', 0) }}</li>
-        <li>Persisting findings in rescans: {{ dataset.kpis.get('persisting_count', 0) }}</li>
-        <li>Reopened findings after prior absence: {{ dataset.kpis.get('reopened_count', 0) }}</li>
-      </ul>
-    </section>
-
-    <section class="section">
-      <div class="section-header">
-        <h2 class="section-title">Top Hosts</h2>
-        <div class="section-subtitle">Highest occurrence counts in scope</div>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Host</th>
-            <th>Occurrences</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% if dataset.top_hosts %}
-            {% for row in dataset.top_hosts %}
-            <tr>
-              <td>{{ row.host }}</td>
-              <td>{{ row.occurrence_count }}</td>
-            </tr>
-            {% endfor %}
-          {% else %}
-            <tr>
-              <td colspan="2">No findings available for this reporting scope.</td>
-            </tr>
-          {% endif %}
-        </tbody>
-      </table>
-    </section>
-
-    <section class="section">
-      <div class="section-header">
-        <h2 class="section-title">Priority Findings</h2>
-        <div class="section-subtitle">Most recent high-importance items</div>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Host</th>
-            <th>Finding</th>
-            <th>Priority</th>
-            <th>Disposition</th>
-            <th>State</th>
-            <th>VT</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% set important = dataset.findings[:dataset.report_limits.get('top_findings_limit', 20)] %}
-          {% if important %}
-            {% for row in important %}
-            <tr>
-              <td>{{ row.host }}</td>
-              <td>
-                <strong>{{ row.title }}</strong>
-                <div class="meta-row">{{ row.event_type }}{% if row.event_kind %} / {{ row.event_kind }}{% endif %}</div>
-              </td>
-              <td><span class="pill priority-{{ row.priority }}">{{ row.priority }}</span></td>
-              <td><span class="pill disposition-{{ row.current_disposition }}">{{ row.current_disposition }}</span></td>
-              <td>{{ row.state_for_host_run or '-' }}</td>
-              <td>
-                {% if row.vt_summary %}
-                  M={{ row.vt_summary.get('malicious_count', 0) }}, S={{ row.vt_summary.get('suspicious_count', 0) }}
-                {% else %}
-                  -
-                {% endif %}
-              </td>
-            </tr>
-            {% endfor %}
-          {% else %}
-            <tr>
-              <td colspan="6">No findings available for this reporting scope.</td>
-            </tr>
-          {% endif %}
-        </tbody>
-      </table>
-    </section>
-
-    <section class="section">
-      <div class="section-header">
-        <h2 class="section-title">Recurrent False Positives</h2>
-        <div class="section-subtitle">Candidates for upstream Loki suppression review</div>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Rule Key</th>
-            <th>Occurrences</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% if dataset.recurrent_false_positives %}
-            {% for row in dataset.recurrent_false_positives %}
-            <tr>
-              <td class="mono">{{ row.rule_key }}</td>
-              <td>{{ row.occurrences }}</td>
-            </tr>
-            {% endfor %}
-          {% else %}
-            <tr>
-              <td colspan="2">No recurrent false positives are currently recorded.</td>
-            </tr>
-          {% endif %}
-        </tbody>
-      </table>
-      <div class="note">{{ config.get('redaction_note', '') }}</div>
-    </section>
-
-    <section class="section">
-      <div class="section-header">
-        <h2 class="section-title">Technical Appendix</h2>
-        <div class="section-subtitle">Grouped by host for analyst follow-up</div>
-      </div>
-      <div class="note">
-        PDF appendix scope is capped to the top {{ dataset.report_limits.get('appendix_host_limit', 25) }} hosts
-        and the top {{ dataset.report_limits.get('appendix_findings_per_host', 10) }} summarized findings per host.
-        Full detail remains in the machine-readable report export.
-      </div>
-      {% if dataset.appendix %}
-        {% for host, items in dataset.appendix.items() %}
-        <div class="appendix-host">
-          <h3>{{ host }}</h3>
-          <div class="appendix-grid">
-            {% for row in items %}
-            <article class="finding-card">
-              <h4>{{ row.title }}</h4>
-              <div>
-                <span class="pill severity-{{ row.severity }}">{{ row.severity }}</span>
-                <span class="pill priority-{{ row.priority }}">{{ row.priority }}</span>
-                <span class="pill disposition-{{ row.current_disposition }}">{{ row.current_disposition }}</span>
-              </div>
-              <div class="meta-row">
-                First seen: {{ row.first_occurrence_ts }} | Last seen: {{ row.last_occurrence_ts }}
-              </div>
-              <div class="meta-row">Occurrences: {{ row.occurrence_count }} | State: {{ row.state_for_host_run or '-' }}</div>
-              <div class="meta-row">Rule: <span class="mono">{{ row.rule_key }}</span></div>
-              {% if row.artifact_path %}
-              <div class="meta-row">Artifact: {{ row.artifact_path }}</div>
-              {% endif %}
-              {% if row.sha256 %}
-              <div class="meta-row">SHA256: <span class="mono">{{ row.sha256 }}</span></div>
-              {% endif %}
-              <div class="meta-row">Source: {{ row.source_path }}:{{ row.source_line_start }}</div>
-              {% if row.current_reason %}
-              <div class="meta-row">Analyst note: {{ row.current_reason }}</div>
-              {% endif %}
-              {% if row.vt_summary %}
-              <div class="meta-row">VT stats: malicious={{ row.vt_summary.get('malicious_count', 0) }}, suspicious={{ row.vt_summary.get('suspicious_count', 0) }}</div>
-              {% endif %}
-            </article>
-            {% endfor %}
+        <div class="kpi-grid">
+          <div class="kpi">
+            <span class="kpi-label">Hosts Covered</span>
+            <span class="kpi-value">{{ dataset.kpis.get('host_count', 0) }}</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">Occurrences</span>
+            <span class="kpi-value">{{ dataset.kpis.get('occurrence_count', 0) }}</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">Detection Matches</span>
+            <span class="kpi-value">{{ dataset.kpis.get('detection_match_count', 0) }}</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">Artifact Cases</span>
+            <span class="kpi-value">{{ dataset.kpis.get('artifact_case_count', 0) }}</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">Reviewed Cases</span>
+            <span class="kpi-value">{{ dataset.kpis.get('reviewed_case_count', 0) }}</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">Expected Benign</span>
+            <span class="kpi-value">{{ dataset.kpis.get('expected_benign_count', 0) }}</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">Needs Follow-up</span>
+            <span class="kpi-value">{{ dataset.kpis.get('needs_followup_count', 0) }}</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">VT Covered Cases</span>
+            <span class="kpi-value">{{ dataset.kpis.get('vt_covered_case_count', 0) }}</span>
           </div>
         </div>
-        {% endfor %}
-      {% else %}
-        <p>No technical findings were available for this reporting scope.</p>
-      {% endif %}
-    </section>
+        <div class="note">{{ config.get('disclaimer', '') }}</div>
+        <ul class="summary-list">
+          <li>New case occurrences in scope: {{ dataset.kpis.get('new_count', 0) }}</li>
+          <li>Persisting case occurrences in rescans: {{ dataset.kpis.get('persisting_count', 0) }}</li>
+          <li>Reopened case occurrences after prior absence: {{ dataset.kpis.get('reopened_count', 0) }}</li>
+          <li>Unreviewed cases: {{ dataset.kpis.get('unreviewed_count', 0) }}</li>
+          <li>VT missing coverage on hash-bearing cases: {{ dataset.kpis.get('vt_missing_case_count', 0) }}</li>
+          <li>VT no-hit lookups: {{ dataset.kpis.get('vt_not_found_case_count', 0) }}</li>
+          <li>VT lookup errors: {{ dataset.kpis.get('vt_error_case_count', 0) }}</li>
+        </ul>
+      </section>
 
-    <div class="footnote">Generated from immutable Loki evidence and derived triage state.</div>
-  </div>
-</body>
+      <section class="section">
+        <div class="section-header">
+          <h2 class="section-title">Top Hosts</h2>
+          <div class="section-subtitle">Highest case-occurrence counts in scope</div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Host</th>
+              <th>Occurrences</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% if dataset.top_hosts %}
+              {% for row in dataset.top_hosts %}
+              <tr>
+                <td>{{ row.host }}</td>
+                <td>{{ row.occurrence_count }}</td>
+              </tr>
+              {% endfor %}
+            {% else %}
+              <tr>
+                <td colspan="2">No case data available for this reporting scope.</td>
+              </tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <h2 class="section-title">Priority Cases</h2>
+          <div class="section-subtitle">Highest-priority analyst-visible cases</div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Latest Host</th>
+              <th>Case</th>
+              <th>Priority</th>
+              <th>Disposition</th>
+              <th>Coverage</th>
+              <th>VT</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% if dataset.priority_cases %}
+              {% for row in dataset.priority_cases %}
+              <tr>
+                <td>{{ row.latest_host or '-' }}</td>
+                <td>
+                  <strong>{{ row.title }}</strong>
+                  <div class="meta-row">Rules: {{ row.matched_rules }}</div>
+                  <div class="meta-row">Hosts: {{ row.host_count }} | Occurrences: {{ row.occurrence_count }}</div>
+                  {% if row.artifact_path %}
+                  <div class="meta-row">Artifact: {{ row.artifact_path }}</div>
+                  {% endif %}
+                </td>
+                <td><span class="pill priority-{{ row.priority }}">{{ row.priority }}</span></td>
+                <td>
+                  <span class="pill disposition-{{ row.current_disposition }}">{{ row.current_disposition }}</span>
+                  {% if row.current_reason %}
+                  <div class="meta-row">{{ row.current_reason }}</div>
+                  {% endif %}
+                </td>
+                <td>{{ row.state_for_host_run or '-' }}</td>
+                <td>
+                  {% if row.vt_summary %}
+                    M={{ row.vt_summary.get('malicious_count', 0) }}, S={{ row.vt_summary.get('suspicious_count', 0) }}
+                  {% elif row.sha256 and row.vt_result_status == 'not_found' %}
+                    not found
+                  {% elif row.sha256 and row.vt_result_status == 'error' %}
+                    error
+                  {% elif row.sha256 %}
+                    missing
+                  {% else %}
+                    -
+                  {% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+            {% else %}
+              <tr>
+                <td colspan="6">No priority cases are currently eligible for analyst follow-up.</td>
+              </tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <h2 class="section-title">Recurrent Benign Rules</h2>
+          <div class="section-subtitle">Expected benign or false-positive patterns worth upstream suppression review</div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Disposition</th>
+              <th>Rule Key</th>
+              <th>Cases</th>
+              <th>Occurrences</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% if dataset.recurrent_benign_rules %}
+              {% for row in dataset.recurrent_benign_rules %}
+              <tr>
+                <td><span class="pill disposition-{{ row.current_disposition }}">{{ row.current_disposition }}</span></td>
+                <td class="mono">{{ row.rule_key }}</td>
+                <td>{{ row.case_count }}</td>
+                <td>{{ row.occurrence_count }}</td>
+              </tr>
+              {% endfor %}
+            {% else %}
+              <tr>
+                <td colspan="4">No recurrent benign rules are currently recorded.</td>
+              </tr>
+            {% endif %}
+          </tbody>
+        </table>
+        <div class="note">{{ config.get('redaction_note', '') }}</div>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <h2 class="section-title">Technical Appendix</h2>
+          <div class="section-subtitle">Grouped by host for analyst follow-up</div>
+        </div>
+        <div class="note">
+          PDF appendix scope is capped to the top {{ dataset.report_limits.get('appendix_host_limit', 25) }} hosts
+          and the top {{ dataset.report_limits.get('appendix_findings_per_host', 10) }} cases per host.
+          Full detail remains in the machine-readable case export.
+        </div>
+        {% if dataset.appendix %}
+          {% for host, items in dataset.appendix.items() %}
+          <div class="appendix-host">
+            <h3>{{ host }}</h3>
+            <div class="appendix-grid">
+              {% for row in items %}
+              <article class="finding-card">
+                <h4>{{ row.title }}</h4>
+                <div>
+                  <span class="pill severity-{{ row.severity }}">{{ row.severity }}</span>
+                  <span class="pill priority-{{ row.priority }}">{{ row.priority }}</span>
+                  <span class="pill disposition-{{ row.current_disposition }}">{{ row.current_disposition }}</span>
+                </div>
+                <div class="meta-row">Rules: {{ row.matched_rules }}</div>
+                <div class="meta-row">First seen: {{ row.first_occurrence_ts }} | Last seen: {{ row.last_occurrence_ts }}</div>
+                <div class="meta-row">Occurrences: {{ row.occurrence_count }} | State: {{ row.state_for_host_run or '-' }}</div>
+                {% if row.artifact_path %}
+                <div class="meta-row">Artifact: {{ row.artifact_path }}</div>
+                {% endif %}
+                {% if row.sha256 %}
+                <div class="meta-row">SHA256: <span class="mono">{{ row.sha256 }}</span></div>
+                {% endif %}
+                <div class="meta-row">Source: {{ row.source_path }}:{{ row.source_line_start }}</div>
+                {% if row.current_reason %}
+                <div class="meta-row">Analyst or policy note: {{ row.current_reason }}</div>
+                {% endif %}
+                {% if row.vt_summary %}
+                <div class="meta-row">VT stats: malicious={{ row.vt_summary.get('malicious_count', 0) }}, suspicious={{ row.vt_summary.get('suspicious_count', 0) }}</div>
+                {% elif row.sha256 and row.vt_result_status == 'not_found' %}
+                <div class="meta-row">VT status: not found</div>
+                {% elif row.sha256 and row.vt_result_status == 'error' %}
+                <div class="meta-row">VT status: lookup error</div>
+                {% elif row.sha256 %}
+                <div class="meta-row">VT status: missing</div>
+                {% endif %}
+              </article>
+              {% endfor %}
+            </div>
+          </div>
+          {% endfor %}
+        {% else %}
+          <p>No technical cases were available for this reporting scope.</p>
+        {% endif %}
+      </section>
+    </div>
+  </body>
 </html>
