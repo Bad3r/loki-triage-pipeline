@@ -1,7 +1,7 @@
 # Loki Triage Architecture
 
 ## Goal
-Build a CLI-first Python project that ingests raw Loki scan evidence, reconstructs multiline records, persists reusable triage state, enriches hash-bearing findings with VirusTotal through the `vt` CLI, and produces a monthly management report.
+Build a CLI-first Python project that ingests raw Loki scan evidence, reconstructs multiline records, persists reusable raw-detection and case-centric triage state, enriches hash-bearing cases with VirusTotal through the `vt` CLI, and produces a monthly management report.
 
 ## Core principles
 - Raw logs remain immutable in `LokiScanResults/`.
@@ -13,11 +13,12 @@ Build a CLI-first Python project that ingests raw Loki scan evidence, reconstruc
 1. Collect log files from one or more input paths.
 2. Reconstruct logical records using the Loki timestamp prefix.
 3. Normalize records into typed events with provenance.
-4. Derive finding candidates from file, process, and init-error events.
-5. Upsert findings and occurrences into SQLite.
-6. Reuse analyst verdicts by `sha256 + rule` or `context fingerprint + rule`.
-7. Enrich unseen hashes with `vt file --format json`.
-8. Generate machine-readable exports and an executive HTML/PDF report.
+4. Derive raw detection candidates from file, process, and init-error events.
+5. Upsert raw findings and detection occurrences into SQLite.
+6. Collapse raw detections into artifact-centric analyst cases and case occurrences.
+7. Reuse analyst verdicts by case identity and mirror case disposition to child detections.
+8. Enrich unseen case hashes with batched threaded `vt file --format json <hash...>` lookups and cache `ok`, `not_found`, or `error` results.
+9. Generate machine-readable exports and an executive HTML/PDF report with explicit VT coverage state.
 
 ## Repository layout
 - `config/`: versioned YAML configuration.
@@ -30,11 +31,11 @@ Build a CLI-first Python project that ingests raw Loki scan evidence, reconstruc
 ## CLI contract
 - `ingest`: parse and store evidence, write normalized artifacts.
 - `enrich-vt`: look up unseen hashes and cache responses.
-- `review queue`: inspect current triage backlog.
-- `review show`: inspect one finding and its occurrences.
-- `review set`: append a verdict and update current status.
-- `export findings`: emit CSV or JSONL.
-- `report build`: write HTML and PDF output.
+- `review queue`: inspect current case-centric triage backlog.
+- `review show`: inspect one analyst case, its child rules, and its occurrences.
+- `review set`: append a case verdict and update current status.
+- `export findings`: emit case-summary or raw-detection CSV/JSONL.
+- `report build`: write HTML and PDF output and guard against zero VT coverage unless explicitly bypassed.
 
 ## Loki-native vs local policy
 Use Loki-native controls for suppression when possible:
@@ -47,5 +48,28 @@ Use Loki-native controls for suppression when possible:
 Use local YAML for:
 - severity and queueing priorities
 - reporting thresholds and branding
-- local downstream suppression notes
+- local downstream allowlists and analyst-triage policy
 - VT quota profiles
+
+## Active local policy scope
+- Current repo policy keeps automatic benigning intentionally narrow.
+- Active allowlists cover:
+  - archived `loki_*.log` artifacts retained on disk
+  - `RemComSvc.exe` only in `C:\Windows\System32\RemComSvc.exe` or `C:\Windows\SysWOW64\RemComSvc.exe`
+  - approved Intel XTU binaries only under `C:\Windows\System32\DriverStore\FileRepository\xtucomponent.inf_amd64_*`
+- VT enrichment can raise `needs_followup`, but deterministic local policy is the only path to automatic benign classification.
+
+## Report guardrails
+- Report generation fails when scoped hash-bearing cases have zero VT coverage unless `--allow-missing-vt` is supplied.
+- Report generation also fails when the requested scope includes legacy runs with `finding_occurrences` but no corresponding `case_occurrences`.
+- Legacy state must be rebuilt from raw logs before case-centric period reports are trustworthy.
+
+## Fresh rebuild workflow
+- For a clean corpus rerun after VT or policy changes, delete the derived state and rerun the full pipeline:
+  ```bash
+  rm -f state/triage.db
+  rm -rf runs/2026-01
+  uv run loki-triage ingest LokiScanResults --period 2026-01 --run-kind mixed
+  uv run loki-triage enrich-vt --run-id <new-run-id>
+  uv run loki-triage report build --period 2026-01
+  ```
