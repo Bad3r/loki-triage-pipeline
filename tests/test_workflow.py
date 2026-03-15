@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from loki_triage.db import connect, ensure_schema, upsert_vt_lookup
-from loki_triage.ingest import ingest_logs
+from loki_triage.ingest import export_case_rows_for_run, ingest_logs
 from loki_triage.policy import apply_policy_for_sha
 from loki_triage.reporting import build_report
 from loki_triage.review import queue, set_case_verdict, show_case
@@ -32,12 +32,16 @@ def _write_single_file_finding_log(
     severity: str = "ALERT",
     md5: str = "11111111111111111111111111111111",
     sha1: str = "2222222222222222222222222222222222222222",
+    event_ts: str = "20260105T00:00:01Z",
 ) -> Path:
-    payload = f"""20260105T00:00:00Z,{host},NOTICE,Init,Starting Loki Scan VERSION: 0.51.0 SYSTEM: {host} TIME: 20260105T00:00:00Z
-20260105T00:00:01Z,{host},{severity},FileScan,FILE: {artifact_path} SCORE: 150 TYPE: EXE SIZE: 10 FIRST_BYTES: 4d5a MD5: {md5} SHA1: {sha1} SHA256: {sha256} CREATED: Wed Jan  1 00:00:00 2026 MODIFIED: Wed Jan  1 00:00:00 2026 ACCESSED: Wed Jan  1 00:00:00 2026 REASON_1: Yara Rule MATCH: {rule_key} SUBSCORE: 70 DESCRIPTION: test hit REF: https://example.invalid AUTHOR: tester MATCHES:
+    init_ts = "20260105T00:00:00Z"
+    results_ts = "20260105T00:00:02Z"
+    finished_ts = "20260105T00:00:03Z"
+    payload = f"""{init_ts},{host},NOTICE,Init,Starting Loki Scan VERSION: 0.51.0 SYSTEM: {host} TIME: {init_ts}
+{event_ts},{host},{severity},FileScan,FILE: {artifact_path} SCORE: 150 TYPE: EXE SIZE: 10 FIRST_BYTES: 4d5a MD5: {md5} SHA1: {sha1} SHA256: {sha256} CREATED: Wed Jan  1 00:00:00 2026 MODIFIED: Wed Jan  1 00:00:00 2026 ACCESSED: Wed Jan  1 00:00:00 2026 REASON_1: Yara Rule MATCH: {rule_key} SUBSCORE: 70 DESCRIPTION: test hit REF: https://example.invalid AUTHOR: tester MATCHES:
   $a: 'test'
-20260105T00:00:02Z,{host},NOTICE,Results,Results: 1 alerts, 0 warnings, 0 notices
-20260105T00:00:03Z,{host},NOTICE,Results,Finished LOKI Scan
+{results_ts},{host},NOTICE,Results,Results: 1 alerts, 0 warnings, 0 notices
+{finished_ts},{host},NOTICE,Results,Finished LOKI Scan
 """
     log_path.write_text(payload, encoding="utf-8")
     return log_path
@@ -114,7 +118,7 @@ def test_multi_reason_file_finding_collapses_to_one_case(project_root: Path) -> 
     assert case_count["count"] == 1
     assert membership_count["count"] == 2
 
-    queued = queue(project_root=project_root)
+    queued = queue(project_root=project_root, bucket="all")
     assert queued[0]["matched_rules"] == "remcom_remotecommandexecution,id_83692" or queued[0]["matched_rules"] == "id_83692,remcom_remotecommandexecution"
 
 
@@ -125,7 +129,7 @@ def test_default_policy_allowlists_remcom_default_paths(project_root: Path) -> N
 
     ingest_logs([log_path], period="2026-01", run_kind="baseline", project_root=project_root)
 
-    queued = queue(project_root=project_root)
+    queued = queue(project_root=project_root, bucket="all")
     remcom_row = next(row for row in queued if row["title"] == "C:\\Windows\\System32\\RemComSvc.exe")
     assert remcom_row["current_disposition"] == "expected_benign"
 
@@ -152,7 +156,7 @@ def test_default_policy_allowlists_xtu_known_filenames_only(project_root: Path) 
 
     ingest_logs([approved_log, unapproved_log], period="2026-01", run_kind="baseline", project_root=project_root)
 
-    queued = queue(project_root=project_root)
+    queued = queue(project_root=project_root, bucket="all")
     dispositions = {row["title"]: row["current_disposition"] for row in queued}
     assert dispositions["C:\\Windows\\System32\\DriverStore\\FileRepository\\xtucomponent.inf_amd64_deadbeefdeadbeef\\XtuService.exe"] == "expected_benign"
     assert dispositions["C:\\Windows\\System32\\DriverStore\\FileRepository\\xtucomponent.inf_amd64_deadbeefdeadbeef\\Unexpected.dll"] == "unreviewed"
@@ -184,7 +188,7 @@ vt:
     baseline_log = copy_fixture_log("loki_ALPHA_2026-01-01_00-00-00.log")
     ingest_logs([baseline_log], period="2026-01", run_kind="baseline", project_root=project_root)
 
-    queued = queue(project_root=project_root)
+    queued = queue(project_root=project_root, bucket="all")
     assert queued[0]["current_disposition"] == "expected_benign"
 
     payload = show_case(queued[0]["case_id"], project_root=project_root)
@@ -284,7 +288,7 @@ def test_enrich_vt_marks_plain_text_no_hits_as_not_found(project_root: Path, mon
 
 
 
-def test_enrich_vt_includes_notice_but_skips_info(project_root: Path, monkeypatch) -> None:
+def test_enrich_vt_excludes_notice_and_info_by_default(project_root: Path, monkeypatch) -> None:
     info_log = _write_single_file_finding_log(
         project_root / "LokiScanResults" / "loki_INFOHOST_2026-01-10_00-00-00.log",
         host="INFOHOST",
@@ -301,15 +305,24 @@ def test_enrich_vt_includes_notice_but_skips_info(project_root: Path, monkeypatc
         rule_key="SuspiciousBinary",
         severity="NOTICE",
     )
-    run = ingest_logs([info_log, notice_log], period="2026-01", run_kind="baseline", project_root=project_root)
+    warning_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_WARNINGHOST_2026-01-10_00-00-00.log",
+        host="WARNINGHOST",
+        artifact_path=r"C:\Temp\warning.exe",
+        sha256="g" * 64,
+        rule_key="SuspiciousBinary",
+        severity="WARNING",
+    )
+    run = ingest_logs([info_log, notice_log, warning_log], period="2026-01", run_kind="baseline", project_root=project_root)
 
     def fake_run(command, capture_output, text, check):
-        assert ("f" * 64) in command
+        assert ("g" * 64) in command
         assert ("e" * 64) not in command
+        assert ("f" * 64) not in command
         return subprocess.CompletedProcess(
             args=command,
             returncode=0,
-            stdout=json.dumps([{"_id": "f" * 64, "last_analysis_stats": {"malicious": 1, "suspicious": 0}}]),
+            stdout=json.dumps([{"_id": "g" * 64, "last_analysis_stats": {"malicious": 1, "suspicious": 0}}]),
             stderr="",
         )
 
@@ -325,7 +338,101 @@ def test_enrich_vt_includes_notice_but_skips_info(project_root: Path, monkeypatc
         conn.close()
 
     assert result["status_counts"] == {"ok": 1, "not_found": 0, "error": 0}
-    assert [dict(row) for row in rows] == [{"sha256": "f" * 64, "result_status": "ok"}]
+    assert [dict(row) for row in rows] == [{"sha256": "g" * 64, "result_status": "ok"}]
+
+
+def test_enrich_vt_orders_hashes_by_first_occurrence(project_root: Path, monkeypatch) -> None:
+    newer_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_BETA_2026-01-10_00-00-00.log",
+        host="BETA",
+        artifact_path=r"C:\Temp\newer.exe",
+        sha256="h" * 64,
+        rule_key="SuspiciousBinary",
+        severity="WARNING",
+        event_ts="20260105T00:00:09Z",
+    )
+    older_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ALPHA_2026-01-10_00-00-00.log",
+        host="ALPHA",
+        artifact_path=r"C:\Temp\older.exe",
+        sha256="i" * 64,
+        rule_key="SuspiciousBinary",
+        severity="WARNING",
+        event_ts="20260105T00:00:01Z",
+    )
+    run = ingest_logs([newer_log, older_log], period="2026-01", run_kind="baseline", project_root=project_root)
+
+    def fake_run(command, capture_output, text, check):
+        hashes = [part for part in command if len(part) == 64]
+        assert hashes == ["i" * 64, "h" * 64]
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {"_id": "i" * 64, "last_analysis_stats": {"malicious": 0, "suspicious": 0}},
+                    {"_id": "h" * 64, "last_analysis_stats": {"malicious": 0, "suspicious": 0}},
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("loki_triage.vt.subprocess.run", fake_run)
+
+    result = enrich_hashes(run["run_id"], project_root=project_root)
+    assert result["status_counts"] == {"ok": 2, "not_found": 0, "error": 0}
+
+
+def test_enrich_vt_skips_routed_and_suppressed_cases(project_root: Path, monkeypatch) -> None:
+    actionable_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ACTION_2026-01-10_00-00-00.log",
+        host="ACTION",
+        artifact_path=r"C:\Temp\actionable.exe",
+        sha256="j" * 64,
+        rule_key="SuspiciousBinary",
+        severity="WARNING",
+    )
+    routed_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ROUTED_2026-01-10_00-00-00.log",
+        host="ROUTED",
+        artifact_path=r"C:\Users\analyst\Favorites\Links\Interesting.url",
+        sha256="k" * 64,
+        rule_key="methodology_suspicious_shortcut_iconnotfromexeordllorico",
+        severity="WARNING",
+    )
+    suppressed_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_SUPPRESSED_2026-01-10_00-00-00.log",
+        host="SUPPRESSED",
+        artifact_path=r"C:\Program Files\WinRAR\Default.SFX",
+        sha256="l" * 64,
+        rule_key="ID_142693",
+        severity="WARNING",
+    )
+    run = ingest_logs([actionable_log, routed_log, suppressed_log], period="2026-01", run_kind="baseline", project_root=project_root)
+
+    def fake_run(command, capture_output, text, check):
+        hashes = [part for part in command if len(part) == 64]
+        assert hashes == ["j" * 64]
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps([{"_id": "j" * 64, "last_analysis_stats": {"malicious": 0, "suspicious": 0}}]),
+            stderr="",
+        )
+
+    monkeypatch.setattr("loki_triage.vt.subprocess.run", fake_run)
+
+    result = enrich_hashes(run["run_id"], project_root=project_root)
+
+    conn = connect(project_root / "state" / "triage.db")
+    ensure_schema(conn)
+    try:
+        rows = conn.execute("SELECT sha256, result_status FROM vt_lookups ORDER BY sha256 ASC").fetchall()
+    finally:
+        conn.close()
+
+    assert result["status_counts"] == {"ok": 1, "not_found": 0, "error": 0}
+    assert [dict(row) for row in rows] == [{"sha256": "j" * 64, "result_status": "ok"}]
 
 
 def test_vt_signal_marks_case_needs_followup(project_root: Path, copy_fixture_log) -> None:
@@ -489,6 +596,121 @@ def test_active_policy_allowlists_remcom_and_xtu_paths(project_root: Path) -> No
     ] == "unreviewed"
 
 
+def test_occurrence_aware_policy_matches_shared_hash_family_path(project_root: Path) -> None:
+    unsuppressed_first = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ALPHA_2026-01-11_00-00-00.log",
+        host="ALPHA",
+        artifact_path=r"C:\Temp\shared-defaultsfx.bin",
+        sha256="m" * 64,
+        rule_key="ID_142693",
+        severity="WARNING",
+    )
+    suppressible_second = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_BETA_2026-01-11_00-00-00.log",
+        host="BETA",
+        artifact_path=r"C:\Program Files\WinRAR\Default.SFX",
+        sha256="m" * 64,
+        rule_key="ID_142693",
+        severity="WARNING",
+    )
+
+    ingest_logs([unsuppressed_first, suppressible_second], period="2026-01", run_kind="baseline", project_root=project_root)
+
+    conn = connect(project_root / "state" / "triage.db")
+    ensure_schema(conn)
+    try:
+        case_row = conn.execute(
+            "SELECT artifact_path, current_disposition, policy_name FROM cases WHERE sha256 = ?",
+            ("m" * 64,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert case_row["artifact_path"] == r"C:\Temp\shared-defaultsfx.bin"
+    assert case_row["current_disposition"] == "expected_benign"
+    assert case_row["policy_name"] == "suppress-winrar-default-sfx"
+
+
+def test_queue_and_export_bucket_routed_and_suppressed_cases(project_root: Path) -> None:
+    actionable_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ACTION2_2026-01-11_00-00-00.log",
+        host="ACTION2",
+        artifact_path=r"C:\Temp\actionable-two.exe",
+        sha256="n" * 64,
+        rule_key="SuspiciousBinary",
+        severity="WARNING",
+    )
+    routed_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ROUTED2_2026-01-11_00-00-00.log",
+        host="ROUTED2",
+        artifact_path=r"C:\Users\user\Favorites\Links\Portal.url",
+        sha256="o" * 64,
+        rule_key="methodology_suspicious_shortcut_iconnotfromexeordllorico",
+        severity="WARNING",
+    )
+    suppressed_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_SUPPRESSED2_2026-01-11_00-00-00.log",
+        host="SUPPRESSED2",
+        artifact_path=r"C:\Program Files\WinRAR\Default32.SFX",
+        sha256="p" * 64,
+        rule_key="ID_142693",
+        severity="WARNING",
+    )
+    run = ingest_logs([actionable_log, routed_log, suppressed_log], period="2026-01", run_kind="baseline", project_root=project_root)
+
+    actionable = queue(project_root=project_root)
+    routed = queue(project_root=project_root, bucket="routed")
+    suppressed = queue(project_root=project_root, bucket="suppressed")
+
+    assert [row["title"] for row in actionable] == [r"C:\Temp\actionable-two.exe"]
+    assert [row["title"] for row in routed] == [r"C:\Users\user\Favorites\Links\Portal.url"]
+    assert routed[0]["policy_name"] == "route-favorites-url-shortcut"
+    assert [row["title"] for row in suppressed] == [r"C:\Program Files\WinRAR\Default32.SFX"]
+
+    conn = connect(project_root / "state" / "triage.db")
+    ensure_schema(conn)
+    try:
+        routed_export = export_case_rows_for_run(conn, run["run_id"], "routed")
+    finally:
+        conn.close()
+
+    assert len(routed_export) == 1
+    assert routed_export[0]["case_bucket"] == "routed"
+    assert routed_export[0]["policy_name"] == "route-favorites-url-shortcut"
+    assert routed_export[0]["disposition_source"] == "policy"
+
+
+def test_report_build_ignores_vt_guard_for_routed_and_suppressed_only(project_root: Path, monkeypatch) -> None:
+    routed_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_ROUTED3_2026-01-11_00-00-00.log",
+        host="ROUTED3",
+        artifact_path=r"C:\Users\user\Favorites\Links\OnlyRouted.url",
+        sha256="q" * 64,
+        rule_key="methodology_suspicious_shortcut_iconnotfromexeordllorico",
+        severity="WARNING",
+    )
+    suppressed_log = _write_single_file_finding_log(
+        project_root / "LokiScanResults" / "loki_SUPPRESSED3_2026-01-11_00-00-00.log",
+        host="SUPPRESSED3",
+        artifact_path=r"C:\Program Files\WinRAR\Default.SFX",
+        sha256="r" * 64,
+        rule_key="ID_142693",
+        severity="WARNING",
+    )
+    ingest_logs([routed_log, suppressed_log], period="2026-01", run_kind="baseline", project_root=project_root)
+
+    def fake_render_pdf(html_path: Path, pdf_path: Path) -> None:
+        pdf_path.write_bytes(b"%PDF-1.4\n% test fixture\n")
+
+    monkeypatch.setattr("loki_triage.reporting._render_pdf", fake_render_pdf)
+
+    report = build_report("2026-01", project_root=project_root)
+    html = Path(report["html_path"]).read_text(encoding="utf-8")
+
+    assert "Routed URL Review" in html
+    assert "route-favorites-url-shortcut" in html
+
+
 def test_review_and_report_workflow(project_root: Path, copy_fixture_log, monkeypatch) -> None:
     baseline_log = copy_fixture_log("loki_ALPHA_2026-01-01_00-00-00.log")
     result = ingest_logs([baseline_log], period="2026-01", run_kind="baseline", project_root=project_root)
@@ -513,16 +735,13 @@ def test_review_and_report_workflow(project_root: Path, copy_fixture_log, monkey
         pdf_path.write_bytes(b"%PDF-1.4\n% test fixture\n")
 
     monkeypatch.setattr("loki_triage.reporting._render_pdf", fake_render_pdf)
-    with pytest.raises(RuntimeError, match="zero VT coverage"):
-        build_report("2026-01", project_root=project_root)
-
-    report = build_report("2026-01", project_root=project_root, allow_missing_vt=True)
+    report = build_report("2026-01", project_root=project_root)
     assert Path(report["html_path"]).exists()
     assert Path(report["pdf_path"]).exists()
     assert Path(report["csv_path"]).exists()
     html = Path(report["html_path"]).read_text(encoding="utf-8")
     assert "Artifact Cases" in html
-    assert "VT missing coverage on hash-bearing cases" in html
+    assert "Routed URL Review" in html
 
 
 def test_report_surfaces_vt_not_found_state(project_root: Path, copy_fixture_log, monkeypatch) -> None:

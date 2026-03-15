@@ -1,7 +1,6 @@
 profile: public_safe
 daily_request_limit: 1000
 eligible_severities:
-  - NOTICE
   - WARNING
   - ERROR
   - ALERT

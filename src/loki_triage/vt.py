@@ -40,26 +40,24 @@ def _eligible_severities(runtime_config: RuntimeConfig) -> tuple[str, ...]:
 
 def _pending_hashes(conn, profile_name: str, eligible_severities: tuple[str, ...], run_id: str | None = None) -> list[str]:
     severity_placeholders = ",".join("?" for _ in eligible_severities)
-    params: list[Any] = [profile_name, *eligible_severities]
+    params: list[Any] = [profile_name, "expected_benign", "false_positive", *eligible_severities]
     run_clause = ""
     if run_id:
         run_clause = " AND co.run_id = ?"
         params.append(run_id)
     rows = conn.execute(
         f"""
-        SELECT DISTINCT c.sha256
+        SELECT c.sha256
         FROM cases c
         LEFT JOIN vt_lookups v ON v.sha256 = c.sha256 AND v.lookup_profile = ?
+        JOIN case_occurrences co ON co.case_id = c.id
         WHERE c.sha256 IS NOT NULL
           AND v.id IS NULL
-          AND EXISTS (
-              SELECT 1
-              FROM case_occurrences co
-              WHERE co.case_id = c.id
-                AND co.severity IN ({severity_placeholders})
-                {run_clause}
-          )
-        ORDER BY c.sha256 ASC
+          AND c.current_disposition NOT IN (?, ?)
+          AND co.severity IN ({severity_placeholders})
+          {run_clause}
+        GROUP BY c.id, c.sha256
+        ORDER BY MIN(COALESCE(co.occurrence_ts, c.first_seen_at)) ASC, c.id ASC
         """,
         params,
     ).fetchall()

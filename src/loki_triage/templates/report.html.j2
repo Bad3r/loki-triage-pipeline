@@ -265,6 +265,9 @@
           <li>Persisting case occurrences in rescans: {{ dataset.kpis.get('persisting_count', 0) }}</li>
           <li>Reopened case occurrences after prior absence: {{ dataset.kpis.get('reopened_count', 0) }}</li>
           <li>Unreviewed cases: {{ dataset.kpis.get('unreviewed_count', 0) }}</li>
+          <li>Actionable cases: {{ dataset.kpis.get('actionable_case_count', 0) }}</li>
+          <li>Routed URL review cases: {{ dataset.kpis.get('routed_case_count', 0) }}</li>
+          <li>Suppressed deterministic benign cases: {{ dataset.kpis.get('suppressed_case_count', 0) }}</li>
           <li>VT missing coverage on hash-bearing cases: {{ dataset.kpis.get('vt_missing_case_count', 0) }}</li>
           <li>VT no-hit lookups: {{ dataset.kpis.get('vt_not_found_case_count', 0) }}</li>
           <li>VT lookup errors: {{ dataset.kpis.get('vt_error_case_count', 0) }}</li>
@@ -363,8 +366,57 @@
 
       <section class="section">
         <div class="section-header">
+          <h2 class="section-title">Routed URL Review</h2>
+          <div class="section-subtitle">Non-VT shortcut findings kept visible for URL-oriented follow-up</div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Latest Host</th>
+              <th>Case</th>
+              <th>Policy</th>
+              <th>Occurrences</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% if dataset.routed_cases %}
+              {% for row in dataset.routed_cases %}
+              <tr>
+                <td>{{ row.latest_host or '-' }}</td>
+                <td>
+                  <strong>{{ row.title }}</strong>
+                  <div class="meta-row">Rules: {{ row.matched_rules }}</div>
+                  <div class="meta-row">Hosts: {{ row.host_count }} | Occurrences: {{ row.occurrence_count }}</div>
+                  {% if row.artifact_path %}
+                  <div class="meta-row">Artifact: {{ row.artifact_path }}</div>
+                  {% endif %}
+                </td>
+                <td>
+                  <div class="mono">{{ row.policy_name }}</div>
+                  {% if row.current_reason %}
+                  <div class="meta-row">{{ row.current_reason }}</div>
+                  {% endif %}
+                </td>
+                <td>{{ row.occurrence_count }}</td>
+              </tr>
+              {% endfor %}
+            {% else %}
+              <tr>
+                <td colspan="4">No routed URL-review cases are currently recorded.</td>
+              </tr>
+            {% endif %}
+          </tbody>
+        </table>
+        <div class="note">
+          Showing up to {{ dataset.report_limits.get('top_findings_limit', 20) }} routed cases out of
+          {{ dataset.routed_case_count_total }} total routed cases in scope.
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
           <h2 class="section-title">Recurrent Benign Rules</h2>
-          <div class="section-subtitle">Expected benign or false-positive patterns worth upstream suppression review</div>
+          <div class="section-subtitle">Suppressed deterministic benign patterns worth upstream suppression review</div>
         </div>
         <table>
           <thead>
@@ -398,7 +450,7 @@
       <section class="section">
         <div class="section-header">
           <h2 class="section-title">Technical Appendix</h2>
-          <div class="section-subtitle">Grouped by host for analyst follow-up</div>
+          <div class="section-subtitle">Actionable cases grouped by host for analyst follow-up</div>
         </div>
         <div class="note">
           PDF appendix scope is capped to the top {{ dataset.report_limits.get('appendix_host_limit', 25) }} hosts
@@ -446,7 +498,7 @@
           </div>
           {% endfor %}
         {% else %}
-          <p>No technical cases were available for this reporting scope.</p>
+          <p>No actionable technical cases were available for this reporting scope.</p>
         {% endif %}
       </section>
     </div>

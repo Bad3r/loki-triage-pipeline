@@ -9,6 +9,7 @@ from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from .buckets import case_bucket_for_row, case_bucket_sql, case_matches_bucket
 from .config import ProjectPaths, get_project_paths, load_runtime_config
 from .db import connect, ensure_schema, insert_report_run
 from .utils import compact_utc_now, utc_now, write_csv
@@ -92,6 +93,7 @@ def _with_rule_lists(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         matched_rules = str(row.get("matched_rules") or "")
         row["matched_rules_list"] = [item for item in matched_rules.split(",") if item]
         row["vt_summary"] = _load_vt_summary(row)
+        row["case_bucket"] = case_bucket_for_row(row)
         row.pop("vt_summary_json", None)
     return rows
 
@@ -99,6 +101,7 @@ def _with_rule_lists(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _vt_coverage(conn, run_ids: list[str], lookup_profile: str) -> dict[str, int]:
     placeholders = _scope_placeholders(run_ids)
+    actionable_clause, actionable_params = case_bucket_sql("c", "actionable")
     row = conn.execute(
         f"""
         WITH scoped_cases AS (
@@ -106,6 +109,7 @@ def _vt_coverage(conn, run_ids: list[str], lookup_profile: str) -> dict[str, int
             FROM cases c
             JOIN case_occurrences co ON co.case_id = c.id
             WHERE co.run_id IN ({placeholders})
+              AND {actionable_clause}
         )
         SELECT
             SUM(CASE WHEN sc.sha256 IS NOT NULL THEN 1 ELSE 0 END) AS hash_case_count,
@@ -115,7 +119,7 @@ def _vt_coverage(conn, run_ids: list[str], lookup_profile: str) -> dict[str, int
         FROM scoped_cases sc
         LEFT JOIN vt_lookups vt ON vt.sha256 = sc.sha256 AND vt.lookup_profile = ?
         """,
-        [*run_ids, lookup_profile],
+        [*run_ids, *actionable_params, lookup_profile],
     ).fetchone()
     hash_case_count = int(row["hash_case_count"] or 0)
     vt_covered_case_count = int(row["vt_covered_case_count"] or 0)
@@ -146,9 +150,12 @@ def _query_report_dataset(
             "priority_cases": [],
             "appendix": {},
             "recurrent_benign_rules": [],
+            "routed_cases": [],
+            "routed_case_count_total": 0,
             "vt_coverage": {},
         }
     placeholders = _scope_placeholders(run_ids)
+    suppressed_clause, suppressed_params = case_bucket_sql("c", "suppressed")
 
     host_rows = conn.execute(
         f"""
@@ -210,6 +217,8 @@ def _query_report_dataset(
             c.id AS case_id,
             c.title,
             c.current_disposition,
+            c.disposition_source,
+            c.policy_name,
             c.priority,
             c.severity,
             c.current_reason,
@@ -290,6 +299,8 @@ def _query_report_dataset(
             c.id AS case_id,
             c.title,
             c.current_disposition,
+            c.disposition_source,
+            c.policy_name,
             c.priority,
             c.severity,
             c.current_reason,
@@ -363,12 +374,12 @@ def _query_report_dataset(
         JOIN case_metrics ON case_metrics.case_id = c.id
         JOIN case_memberships cm ON cm.case_id = c.id
         JOIN findings f ON f.id = cm.finding_id
-        WHERE c.current_disposition IN ('expected_benign', 'false_positive')
+        WHERE {suppressed_clause}
         GROUP BY c.current_disposition, f.rule_key
         ORDER BY occurrence_count DESC, case_count DESC, f.rule_key ASC
         LIMIT 10
         """,
-        [*run_ids, *run_ids],
+        [*run_ids, *run_ids, *suppressed_params],
     ).fetchall()
 
     vt_coverage = _vt_coverage(conn, run_ids, lookup_profile)
@@ -385,6 +396,8 @@ def _query_report_dataset(
     appendix: dict[str, list[dict[str, Any]]] = defaultdict(list)
     rendered_cases = _with_rule_lists([dict(row) for row in case_rows])
     for row in _with_rule_lists([dict(row) for row in appendix_rows]):
+        if not case_matches_bucket(row, "actionable"):
+            continue
         host = row.get("host") or "unknown-host"
         if appendix_allowed_hosts and host not in appendix_allowed_hosts:
             continue
@@ -392,16 +405,22 @@ def _query_report_dataset(
             continue
         appendix[host].append(row)
 
-    suppressed = {"expected_benign", "false_positive"}
-    priority_cases = [row for row in rendered_cases if row.get("current_disposition") not in suppressed]
+    priority_cases = [row for row in rendered_cases if case_matches_bucket(row, "actionable")]
+    routed_cases = [row for row in rendered_cases if case_matches_bucket(row, "routed")]
+    kpis = dict(kpis_row) if kpis_row else {}
+    kpis["actionable_case_count"] = sum(1 for row in rendered_cases if case_matches_bucket(row, "actionable"))
+    kpis["routed_case_count"] = len(routed_cases)
+    kpis["suppressed_case_count"] = sum(1 for row in rendered_cases if case_matches_bucket(row, "suppressed"))
 
     return {
-        "kpis": {**(dict(kpis_row) if kpis_row else {}), **vt_coverage},
+        "kpis": {**kpis, **vt_coverage},
         "top_hosts": [dict(row) for row in host_rows[:TOP_HOSTS_LIMIT]],
         "cases": rendered_cases,
         "priority_cases": priority_cases[:top_findings_limit],
         "appendix": dict(appendix),
         "recurrent_benign_rules": [dict(row) for row in recurrent_benign_rows],
+        "routed_cases": routed_cases[:top_findings_limit],
+        "routed_case_count_total": len(routed_cases),
         "report_limits": {
             "top_findings_limit": top_findings_limit,
             "appendix_host_limit": appendix_host_limit,
@@ -506,6 +525,9 @@ def build_report(
                 "current_disposition",
                 "priority",
                 "severity",
+                "case_bucket",
+                "policy_name",
+                "disposition_source",
                 "artifact_path",
                 "sha256",
                 "occurrence_count",

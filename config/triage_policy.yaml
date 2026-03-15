@@ -9,10 +9,54 @@ defaults:
 allowlists:
   sha256: []
   path_rule_patterns:
-    - name: approved-archived-loki-output
-      rule_key: id_133015
-      path_regex: '(?i)(?:^|[\\/])loki_[^\\/]+\.log$'
-      reason: Historical Loki output retained on disk
+    - name: suppress-historical-loki-output
+      path_regex: '(?i)(?:^|[\\/])loki_[^\\/]+\.(?:log|txt)$'
+      reason: Historical Loki output retained on disk should not consume VT quota
+    - name: route-favorites-url-shortcut
+      disposition: false_positive
+      rule_key: methodology_suspicious_shortcut_iconnotfromexeordllorico
+      path_regex: '(?i)^c:\\users\\[^\\]+\\favorites(?:\\[^\\]+)*\\[^\\]+\.url$'
+      reason: Favorites Internet shortcut routed for URL review instead of VT file reputation
+    - name: suppress-desktopcentral-resources
+      rule_key: '\\imagesimgjsfontscssswfthemeslogerror_docs\\\\020\.exedll'
+      path_regex: '(?i)^[a-z]:\\program files \\(x86\\)\\desktopcentral_agent\\images\\resources\.exe$'
+      reason: DesktopCentral static agent resource
+    - name: suppress-gvclient-user-crt
+      rule_key: susp_certificate_payload
+      path_regex: '(?i)^c:\\program files \\(x86\\)\\gvclient\\app-[^\\]+\\(?:platformhub|agentengine)\\user\.crt$'
+      reason: GVClient packaged certificate artifact
+    - name: suppress-websense-eca-install-pdf
+      rule_key: id_989714
+      path_regex: '(?i)^c:\\program files\\websense\\websense endpoint\\eca-install\.pdf$'
+      reason: Websense packaged documentation sample
+    - name: suppress-office-sample-solvsamp
+      rule_key: id_150742
+      path_regex: '(?i)^c:\\program files(?: \\(x86\\))?\\(?:microsoft office\\(?:office\\d+|root\\office\\d+)|windowsapps\\[^\\]+\\office\\d+)\\samples\\solvsamp\.xls$'
+      reason: Microsoft Office sample workbook
+    - name: suppress-office-sample-exptoows
+      rule_key: id_150742
+      path_regex: '(?i)^(?:c:\\program files(?: \\(x86\\))?\\microsoft office\\(?:office\\d+|root\\office\\d+)\\(?:1025|1033|1049)\\exptoows\.xla|c:\\windows\\installer\\$patchcache\\$\\managed\\[^\\]+\\[^\\]+\\exptoows\.xla\.(?:1025|1033))$'
+      reason: Microsoft Office sample add-in
+    - name: suppress-adobe-template-pdfs
+      rule_key: id_989714
+      path_regex: '(?i)^[a-z]:\\(?:d-drive\\)?program files(?: \\(x86\\))?\\adobe\\(?:acrobat(?: reader)? dc|acrobat 2015|acrobat 9\.0|reader 10\.0)\\(?:acrobat|reader)\\doctemplates\\(?:enu|mea)\\template[123]\.pdf$'
+      reason: Adobe packaged sample PDF template
+    - name: suppress-adobe-pdfsigqformalrep
+      rule_key: id_989714
+      path_regex: '(?i)^[a-z]:\\(?:d-drive\\)?program files(?: \\(x86\\))?\\adobe\\(?:acrobat(?: reader)? dc|acrobat 2015|reader 10\.0)\\(?:acrobat|reader)\\pdfsigqformalrep\.pdf$'
+      reason: Adobe packaged sample PDF
+    - name: suppress-adobe-dynamic-pdf
+      rule_key: id_989714
+      path_regex: '(?i)^[a-z]:\\(?:d-drive\\)?program files(?: \\(x86\\))?\\adobe\\(?:acrobat(?: reader)? dc|acrobat 2015)\\(?:acrobat|reader)\\plug_ins\\annotations\\stamps\\(?:enu|mea)\\dynamic\.pdf$'
+      reason: Adobe packaged dynamic stamp sample
+    - name: suppress-winrar-default-sfx
+      rule_key: id_142693
+      path_regex: '(?i)^[a-z]:\\program files\\winrar\\default(?:32)?\.sfx$'
+      reason: WinRAR packaged default self-extractor stub
+    - name: suppress-hp-sure-click-firefox
+      rule_key: 'levenshtein check - filename looks much like a well-known system file subscore: 40 original: firefox.exe'
+      path_regex: '(?i)^c:\\program files\\hp\\sure click(?:\\[^\\]+)?(?:\\tmp)?\\servers\\firefox_\.exe$'
+      reason: HP Sure Click packaged browser component
     - name: approved-remcom-service
       rule_key:
         - remcom_remotecommandexecution

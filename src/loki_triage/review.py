@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .buckets import case_bucket_for_row, case_bucket_sql, normalize_case_bucket
 from .config import get_project_paths, load_runtime_config
 from .db import connect, ensure_schema, record_case_verdict
 from .utils import format_table
@@ -18,15 +19,23 @@ def _connection(project_root: Path | None = None):
 
 
 
-def queue(statuses: list[str] | None = None, project_root: Path | None = None) -> list[dict[str, Any]]:
+def queue(
+    statuses: list[str] | None = None,
+    bucket: str = "actionable",
+    project_root: Path | None = None,
+) -> list[dict[str, Any]]:
     conn = _connection(project_root)
     try:
         params: list[Any] = []
-        status_clause = ""
+        where_clauses: list[str] = []
+        bucket_clause, bucket_params = case_bucket_sql("c", normalize_case_bucket(bucket))
+        where_clauses.append(bucket_clause)
+        params.extend(bucket_params)
         if statuses:
             placeholders = ",".join("?" for _ in statuses)
-            status_clause = f"WHERE c.current_disposition IN ({placeholders})"
+            where_clauses.append(f"c.current_disposition IN ({placeholders})")
             params.extend(statuses)
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         rows = conn.execute(
             f"""
             WITH case_metrics AS (
@@ -49,6 +58,9 @@ def queue(statuses: list[str] | None = None, project_root: Path | None = None) -
                 c.priority,
                 c.severity,
                 c.current_disposition,
+                c.current_reason,
+                c.policy_name,
+                c.disposition_source,
                 c.title,
                 m.occurrences,
                 m.hosts,
@@ -57,7 +69,7 @@ def queue(statuses: list[str] | None = None, project_root: Path | None = None) -
             FROM cases c
             JOIN case_metrics m ON m.case_id = c.id
             LEFT JOIN case_rules r ON r.case_id = c.id
-            {status_clause}
+            {where_sql}
             ORDER BY
                 CASE c.priority
                     WHEN 'critical' THEN 5
@@ -71,28 +83,41 @@ def queue(statuses: list[str] | None = None, project_root: Path | None = None) -
             """,
             params,
         ).fetchall()
-        return [dict(row) for row in rows]
+        payload = [dict(row) for row in rows]
+        for row in payload:
+            row["case_bucket"] = case_bucket_for_row(row)
+        return payload
     finally:
         conn.close()
 
 
 
-def queue_table(statuses: list[str] | None = None, project_root: Path | None = None) -> str:
-    rows = queue(statuses, project_root)
-    return format_table(
-        rows,
-        [
-            ("case_id", "Case"),
-            ("priority", "Priority"),
-            ("severity", "Severity"),
-            ("current_disposition", "Disposition"),
-            ("occurrences", "Occ"),
-            ("hosts", "Hosts"),
-            ("last_seen", "Last Seen"),
-            ("matched_rules", "Rules"),
-            ("title", "Title"),
-        ],
-    )
+def queue_table(
+    statuses: list[str] | None = None,
+    bucket: str = "actionable",
+    project_root: Path | None = None,
+) -> str:
+    normalized_bucket = normalize_case_bucket(bucket)
+    rows = queue(statuses, normalized_bucket, project_root)
+    columns = [
+        ("case_id", "Case"),
+        ("priority", "Priority"),
+        ("severity", "Severity"),
+        ("current_disposition", "Disposition"),
+        ("occurrences", "Occ"),
+        ("hosts", "Hosts"),
+        ("last_seen", "Last Seen"),
+    ]
+    if normalized_bucket != "actionable":
+        columns.extend(
+            [
+                ("case_bucket", "Bucket"),
+                ("policy_name", "Policy"),
+                ("current_reason", "Reason"),
+            ]
+        )
+    columns.extend([("matched_rules", "Rules"), ("title", "Title")])
+    return format_table(rows, columns)
 
 
 

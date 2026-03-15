@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Iterable
 
+from .buckets import case_bucket_for_row, case_bucket_sql, normalize_case_bucket
 from .classify import build_finding_candidates
 from .config import ProjectPaths, ensure_project_layout, get_project_paths, load_runtime_config
 from .db import (
@@ -254,6 +255,7 @@ def update_case_occurrence_states_for_run(conn, run_id: str) -> None:
 
 
 def queue_rows_for_run(conn, run_id: str) -> list[dict[str, Any]]:
+    bucket_clause, bucket_params = case_bucket_sql("c", "actionable")
     rows = conn.execute(
         """
         WITH case_metrics AS (
@@ -278,6 +280,8 @@ def queue_rows_for_run(conn, run_id: str) -> list[dict[str, Any]]:
             c.severity,
             c.current_disposition,
             c.current_reason,
+            c.policy_name,
+            c.disposition_source,
             c.title,
             c.artifact_path,
             m.occurrences,
@@ -287,6 +291,9 @@ def queue_rows_for_run(conn, run_id: str) -> list[dict[str, Any]]:
         FROM case_metrics m
         JOIN cases c ON c.id = m.case_id
         LEFT JOIN case_rules r ON r.case_id = c.id
+        WHERE """
+        + bucket_clause
+        + """
         ORDER BY
             CASE c.priority
                 WHEN 'critical' THEN 5
@@ -306,13 +313,17 @@ def queue_rows_for_run(conn, run_id: str) -> list[dict[str, Any]]:
             m.last_seen DESC,
             c.id ASC
         """,
-        (run_id,),
+        (run_id, *bucket_params),
     ).fetchall()
-    return [dict(row) for row in rows]
+    payload = [dict(row) for row in rows]
+    for row in payload:
+        row["case_bucket"] = case_bucket_for_row(row)
+    return payload
 
 
 
-def export_case_rows_for_run(conn, run_id: str) -> list[dict[str, Any]]:
+def export_case_rows_for_run(conn, run_id: str, bucket: str = "all") -> list[dict[str, Any]]:
+    bucket_clause, bucket_params = case_bucket_sql("c", normalize_case_bucket(bucket))
     rows = conn.execute(
         """
         WITH scoped_occurrences AS (
@@ -344,6 +355,8 @@ def export_case_rows_for_run(conn, run_id: str) -> list[dict[str, Any]]:
             c.priority,
             c.current_disposition,
             c.current_reason,
+            c.policy_name,
+            c.disposition_source,
             c.artifact_path,
             c.sha256,
             m.occurrence_count,
@@ -357,6 +370,9 @@ def export_case_rows_for_run(conn, run_id: str) -> list[dict[str, Any]]:
         FROM case_metrics m
         JOIN cases c ON c.id = m.case_id
         LEFT JOIN case_rules r ON r.case_id = c.id
+        WHERE """
+        + bucket_clause
+        + """
         ORDER BY
             CASE c.priority
                 WHEN 'critical' THEN 5
@@ -368,13 +384,17 @@ def export_case_rows_for_run(conn, run_id: str) -> list[dict[str, Any]]:
             m.last_occurrence_ts DESC,
             c.id ASC
         """,
-        (run_id,),
+        (run_id, *bucket_params),
     ).fetchall()
-    return [dict(row) for row in rows]
+    payload = [dict(row) for row in rows]
+    for row in payload:
+        row["case_bucket"] = case_bucket_for_row(row)
+    return payload
 
 
 
-def export_raw_rows_for_run(conn, run_id: str) -> list[dict[str, Any]]:
+def export_raw_rows_for_run(conn, run_id: str, bucket: str = "all") -> list[dict[str, Any]]:
+    bucket_clause, bucket_params = case_bucket_sql("c", normalize_case_bucket(bucket))
     rows = conn.execute(
         """
         SELECT
@@ -401,17 +421,31 @@ def export_raw_rows_for_run(conn, run_id: str) -> list[dict[str, Any]]:
             f.current_reason,
             cm.case_id,
             c.current_disposition AS case_disposition,
-            c.current_reason AS case_reason
+            c.current_reason AS case_reason,
+            c.policy_name AS case_policy_name,
+            c.disposition_source AS case_disposition_source
         FROM finding_occurrences fo
         JOIN findings f ON f.id = fo.finding_id
         LEFT JOIN case_memberships cm ON cm.finding_id = f.id
         LEFT JOIN cases c ON c.id = cm.case_id
         WHERE fo.run_id = ?
+          AND """
+        + bucket_clause
+        + """
         ORDER BY fo.host, fo.occurrence_ts, fo.id
         """,
-        (run_id,),
+        (run_id, *bucket_params),
     ).fetchall()
-    return [dict(row) for row in rows]
+    payload = [dict(row) for row in rows]
+    for row in payload:
+        row["case_bucket"] = case_bucket_for_row(
+            {
+                "current_disposition": row.get("case_disposition"),
+                "policy_name": row.get("case_policy_name"),
+                "disposition_source": row.get("case_disposition_source"),
+            }
+        )
+    return payload
 
 
 

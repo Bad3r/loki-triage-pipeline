@@ -60,8 +60,12 @@ def enrich_vt(
 @review_app.command("queue")
 def review_queue(
     status: Annotated[list[str], typer.Option("--status", help="Optional disposition filter")] = [],
+    bucket: Annotated[
+        str,
+        typer.Option("--bucket", help="One of actionable, routed, suppressed, or all"),
+    ] = "actionable",
 ) -> None:
-    typer.echo(queue_table(status or None))
+    typer.echo(queue_table(status or None, bucket))
 
 
 @review_app.command("show")
@@ -93,13 +97,21 @@ def export_findings(
     run_id: Annotated[str, typer.Option("--run-id", help="Run identifier to export")],
     format: Annotated[str, typer.Option("--format", help="csv or jsonl")] = "csv",
     scope: Annotated[str, typer.Option("--scope", help="cases or raw")] = "cases",
+    bucket: Annotated[
+        str,
+        typer.Option("--bucket", help="One of actionable, routed, suppressed, or all"),
+    ] = "actionable",
 ) -> None:
     paths = get_project_paths()
     conn = connect(paths.db_path)
     ensure_schema(conn)
     try:
         period = _run_period(conn, run_id)
-        rows = export_case_rows_for_run(conn, run_id) if scope == "cases" else export_raw_rows_for_run(conn, run_id)
+        rows = (
+            export_case_rows_for_run(conn, run_id, bucket)
+            if scope == "cases"
+            else export_raw_rows_for_run(conn, run_id, bucket)
+        )
     finally:
         conn.close()
     output_dir = paths.runs_dir / period / run_id / "exports"
