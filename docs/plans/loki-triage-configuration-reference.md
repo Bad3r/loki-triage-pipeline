@@ -34,7 +34,7 @@ This document lists every runtime configuration file loaded by `src/loki_triage/
 
 ## `config/vt_config.yaml`
 - `profile`: active VT profile name. Runtime fallback is `public_safe`. Current repo default is `public_safe`; `private_fast` remains available when the VT quota supports it.
-- `daily_request_limit`: operator-planning ceiling for the current VT key. Current repo value is `1000`. This is documented config today, not an enforced runtime stop.
+- `daily_request_limit`: operator-planning ceiling for the current VT key. Current repo value is `999`. This is documented config today, not an enforced runtime stop.
 - `eligible_severities[]`: Loki severities allowed into VT enrichment. Current repo default is `NOTICE`, `WARNING`, `ERROR`, `ALERT`.
 - `profiles.<name>.batch_size`: number of hashes submitted before sleeping.
 - `profiles.<name>.sleep_seconds`: sleep duration between batches.

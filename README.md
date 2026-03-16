@@ -53,7 +53,7 @@ uv run loki-triage report build --period 2026-01
 
 ## Notes
 - VT enrichment uses batched threaded `vt file --format json <hash...>` lookups only. The project does not upload files.
-- `config/vt_config.yaml` currently documents a `daily_request_limit` of `1000`. This is the operational planning ceiling for the current VT key; the runtime does not enforce that quota yet.
+- `config/vt_config.yaml` currently documents a `daily_request_limit` of `999`. This is the operational planning ceiling for the current VT key; the runtime does not enforce that quota yet.
 - VT lookup scope is limited by `vt_config.yaml -> eligible_severities`, currently `NOTICE`, `WARNING`, `ERROR`, and `ALERT`. `INFO` and `RESULT` findings are not sent to VT.
 - VT lookup states are:
   - `ok`: VT returned a record and the cached summary is available

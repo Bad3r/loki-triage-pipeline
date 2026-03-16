@@ -1,5 +1,5 @@
 profile: public_safe
-daily_request_limit: 1000
+daily_request_limit: 999
 eligible_severities:
   - NOTICE
   - WARNING
